@@ -8,6 +8,8 @@
 
 An experimental Windows project combining a native user interface, a GDI overlay, and a kernel component. It is designed for local sessions and offline testing environments.
 I wanted to see whether I could combine an offset dumper, a driver mapper, a kernel driver, and a user-mode application into a single, continuously self-updating project. The result provides a powerful foundation for building great things!
+Briefly, consider encrypting all strings, employing methods from my other repositories, and loading the driver in byte format to improve portability. While this approach does not guarantee the comprehensive outcome you may be seeking, it provides a foundational step. Naturally, this is intended solely for educational purposes.
+
 
 > [!WARNING]
 > This repository is provided for educational purposes and local testing only. Using it on public, competitive, or anti-cheat-protected servers may violate the game's terms of service. You are solely responsible for how you use it.
@@ -22,7 +24,7 @@ I wanted to see whether I could combine an offset dumper, a driver mapper, a ker
 - Config profiles automatically discovered from the Documents folder.
 
 
-<img width="1763" height="724" alt="image" src="https://github.com/user-attachments/assets/ce6b4b9d-ad7d-4722-a5f9-7ba850c887d7" />
+<img width="1675" height="1014" alt="image" src="https://github.com/user-attachments/assets/bb36b2e3-2cf0-49d7-a972-1cc17934a2c7" />
 
 
 ## Features
