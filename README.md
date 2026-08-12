@@ -7,6 +7,7 @@
 ![Author](https://img.shields.io/badge/by-Leksa667-8A2BE2?style=for-the-badge)
 
 An experimental Windows project combining a native user interface, a GDI overlay, and a kernel component. It is designed for local sessions and offline testing environments.
+I wanted to see whether I could combine an offset dumper, a driver mapper, a kernel driver, and a user-mode application into a single, continuously self-updating project. The result provides a powerful foundation for building great things!
 
 > [!WARNING]
 > This repository is provided for educational purposes and local testing only. Using it on public, competitive, or anti-cheat-protected servers may violate the game's terms of service. You are solely responsible for how you use it.
