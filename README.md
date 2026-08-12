@@ -20,6 +20,10 @@ An experimental Windows project combining a native user interface, a GDI overlay
 - Native x64 user-mode application and kernel component.
 - Config profiles automatically discovered from the Documents folder.
 
+
+<img width="1763" height="724" alt="image" src="https://github.com/user-attachments/assets/ce6b4b9d-ad7d-4722-a5f9-7ba850c887d7" />
+
+
 ## Features
 
 ### Interface
