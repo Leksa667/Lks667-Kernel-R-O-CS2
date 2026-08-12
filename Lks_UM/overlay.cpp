@@ -712,6 +712,10 @@ static bool ReadPlayers(
     const uintptr_t spottedMaskOff =
         FindFieldOff(
             "client.dll", "EntitySpottedState_t", "m_bSpottedByMask");
+    const uintptr_t observerServicesOff = FindFieldOff(
+        "client.dll", "C_BasePlayerPawn", "m_pObserverServices");
+    const uintptr_t observerTargetOff = FindFieldOff(
+        "client.dll", "CPlayer_ObserverServices", "m_hObserverTarget");
 
     if (!entityListOff || !localPawnOff || !viewMatrixOff ||
         !sceneNodeOff || !modelStateOff || !healthOff || !teamOff ||
@@ -861,6 +865,34 @@ static bool ReadPlayers(
         }
     }
 
+    uintptr_t viewedPawn = localPawn;
+    if (localPawn && observerServicesOff && observerTargetOff) {
+        uintptr_t observerServices = 0;
+        uint32_t observerTarget = 0xFFFFFFFFu;
+        if (ExecuteExactReads({{
+                localPawn + observerServicesOff,
+                &observerServices,
+                sizeof(observerServices)}}) == 1 && observerServices &&
+            ExecuteExactReads({{
+                observerServices + observerTargetOff,
+                &observerTarget,
+                sizeof(observerTarget)}}) == 1 &&
+            observerTarget != 0 && observerTarget != 0xFFFFFFFFu) {
+            const uintptr_t targetIndex = observerTarget & 0x7FFFu;
+            uintptr_t targetBucket = 0;
+            uintptr_t targetPawn = 0;
+            if (ExecuteExactReads({{
+                    entityList + 0x10 + sizeof(uintptr_t) * (targetIndex >> 9),
+                    &targetBucket,
+                    sizeof(targetBucket)}}) == 1 && targetBucket &&
+                ExecuteExactReads({{
+                    targetBucket + entityStride * (targetIndex & 0x1FF),
+                    &targetPawn,
+                    sizeof(targetPawn)}}) == 1 && targetPawn)
+                viewedPawn = targetPawn;
+        }
+    }
+
     std::array<int, maxEntities> health = {};
     std::array<uint8_t, maxEntities> lifeStates = {};
     std::array<uint8_t, maxEntities> controllerAlive = {};
@@ -871,7 +903,7 @@ static bool ReadPlayers(
     std::array<uint64_t, maxEntities> spottedMasks = {};
     int localControllerSlot = -1;
     for (int i = 0; i < maxEntities; ++i) {
-        if (pawns[i] == localPawn) {
+        if (pawns[i] == viewedPawn) {
             
             
             localControllerSlot = i;
@@ -945,7 +977,7 @@ static bool ReadPlayers(
     if (completedJobs < statsJobCount) {
         jobs.clear();
         for (int i = 0; i < maxEntities; ++i) {
-            if (!pawns[i] || pawns[i] == localPawn) continue;
+            if (!pawns[i] || pawns[i] == viewedPawn) continue;
             const bool looksDead =
                 health[i] <= 0 || health[i] > 100 ||
                 (lifeStateOff && lifeStates[i] != 0) ||
@@ -972,7 +1004,7 @@ static bool ReadPlayers(
 
     for (int i = 0; i < maxEntities; ++i) {
         if (!pawns[i]) continue;
-        if (pawns[i] == localPawn) {
+        if (pawns[i] == viewedPawn) {
             localTeamOut = teams[i];
             continue;
         }
@@ -1033,6 +1065,7 @@ static std::string FriendlyWorldName(std::string name) {
 static bool ReadWorldEntities(
     uintptr_t client,
     const EspSettings& settings,
+    const std::vector<PlayerEnt>& players,
     std::vector<WorldEnt>& output) {
     output.clear();
     if (!client ||
@@ -1216,6 +1249,19 @@ static bool ReadWorldEntities(
         if (!std::isfinite(world.origin.x) ||
             !std::isfinite(world.origin.y) ||
             !std::isfinite(world.origin.z)) continue;
+        if (candidate.type != ENT_BOMB) {
+            bool overlapsInventory = false;
+            for (const auto& player : players) {
+                const float dx = world.origin.x - player.origin.x;
+                const float dy = world.origin.y - player.origin.y;
+                const float dz = world.origin.z - player.origin.z;
+                if (dx * dx + dy * dy <= 144.f && dz >= -8.f && dz <= 88.f) {
+                    overlapsInventory = true;
+                    break;
+                }
+            }
+            if (overlapsInventory) continue;
+        }
         output.push_back(std::move(world));
     }
     return g_Client.IsTransportHealthy();
@@ -1776,7 +1822,10 @@ static void OverlayLoop(HANDLE hProc) {
                     ReadBombInfo(hProc, clientBase, latestBomb);
                 if (readFinished >= nextWorldScan) {
                     ReadWorldEntities(
-                        clientBase, espSettings, latestWorldEntities);
+                        clientBase,
+                        espSettings,
+                        next->players,
+                        latestWorldEntities);
                     nextWorldScan = readFinished +
                         std::chrono::milliseconds(750);
                 }
@@ -1990,6 +2039,12 @@ static void OverlayLoop(HANDLE hProc) {
         if (snapshot) {
             for (const auto& world : snapshot->worldEntities) {
                 if (world.owner) continue;
+                if (world.type == ENT_WEAPON && !espSettings.showWeapons)
+                    continue;
+                if (world.type == ENT_GRENADE && !espSettings.showGrenades)
+                    continue;
+                if (world.type == ENT_BOMB && !espSettings.showBomb)
+                    continue;
                 const Vec2 point = W2S(world.origin, vm, sw, sh);
                 if (point.x < 0.f || point.y < 0.f ||
                     point.x >= sw || point.y >= sh) continue;
