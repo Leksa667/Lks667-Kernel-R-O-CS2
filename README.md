@@ -92,7 +92,7 @@ Lks_CS2_KM_UM/
 
 ## Building
 
-1. Open `Lks_KernelDriver.sln` with Visual Studio 2022.
+1. Open `Lks_Kernel.sln` with Visual Studio 2022.
 2. Select `Release` and `x64`.
 3. Build the `Lks_KernelDriver` project.
 4. Open `Lks_UM/Lks_UM.vcxproj`.
