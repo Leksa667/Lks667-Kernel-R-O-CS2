@@ -5,6 +5,7 @@
 // =============================================================================
 
 #include "overlay.hpp"
+#include "hud_window.hpp"
 #include "LksClient.hpp"
 #include <tlhelp32.h>
 #include <dwmapi.h>
@@ -140,6 +141,13 @@ static uintptr_t GetModuleBase(HANDLE hProc, const wchar_t* name) {
 
 static void DrawBox(HDC dc, int x, int y, int w, int h, COLORREF col, int style) {
     HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    if (style == BOX_FILLED_2D) {
+        HBRUSH fill = CreateSolidBrush(
+            RGB(GetRValue(col) / 4, GetGValue(col) / 4, GetBValue(col) / 4));
+        RECT rc = {x, y, x + w, y + h};
+        FillRect(dc, &rc, fill);
+        DeleteObject(fill);
+    }
     const auto drawPath = [&]() {
         if (style == BOX_CORNER_2D) {
             const int corner = std::clamp(std::min(w, h) / 4, 7, 16);
@@ -154,6 +162,10 @@ static void DrawBox(HDC dc, int x, int y, int w, int h, COLORREF col, int style)
             }
         } else if (style == BOX_ROUNDED_2D) {
             RoundRect(dc, x, y, x + w, y + h, 10, 10);
+        } else if (style == BOX_CIRCLE_2D) {
+            const int d = std::min(w, h);
+            Ellipse(dc, x + (w - d) / 2, y + (h - d) / 2,
+                x + (w + d) / 2, y + (h + d) / 2);
         } else {
             Rectangle(dc, x, y, x + w, y + h);
         }
@@ -1279,6 +1291,11 @@ static void DoSoftAim(HANDLE hProc, uintptr_t client, const std::vector<PlayerEn
 
     static float g_SmoothVelX = 0.f, g_SmoothVelY = 0.f;
     static float g_ResidualX = 0.f, g_ResidualY = 0.f;
+    static float g_SpringPosX = 0.f, g_SpringPosY = 0.f;
+    static float g_SpringVelX = 0.f, g_SpringVelY = 0.f;
+    static float g_EuroXPrev = 0.f, g_EuroYPrev = 0.f;
+    static float g_EuroDXPrev = 0.f, g_EuroDYPrev = 0.f;
+    static bool g_EuroInit = false;
     static uintptr_t g_LastTargetPawn = 0;
     static bool g_HasLocked = false;
     static bool g_WasKeyDown = false;
@@ -1296,6 +1313,9 @@ static void DoSoftAim(HANDLE hProc, uintptr_t client, const std::vector<PlayerEn
     const auto resetMotion = [&]() {
         g_SmoothVelX = g_SmoothVelY = 0.f;
         g_ResidualX = g_ResidualY = 0.f;
+        g_SpringPosX = g_SpringPosY = 0.f;
+        g_SpringVelX = g_SpringVelY = 0.f;
+        g_EuroInit = false;
     };
     const auto releaseTarget = [&](const char* reason) {
         if (g_LastTargetPawn) {
@@ -1554,38 +1574,116 @@ static void DoSoftAim(HANDLE hProc, uintptr_t client, const std::vector<PlayerEn
 
     const float smoothFactor =
         std::clamp(aimSettings.aimSmooth, 1.f, 50.f);
-    float rawDx = pixelDx / smoothFactor * aimDt;
-    float rawDy = pixelDy / smoothFactor * aimDt;
     const float nearScale = std::clamp(pixelDistance / 16.f, 0.2f, 1.f);
-    rawDx *= nearScale;
-    rawDy *= nearScale;
 
-    const float ease = std::clamp(aimSettings.ease, 0.01f, 0.95f);
-    const float easeStep = 1.f - powf(1.f - ease, aimDt);
-
-    if (aimSettings.humanize) {
+    const auto jitterize = [&](float v) {
+        if (!aimSettings.humanize) return v;
         const float jitter = std::clamp(aimSettings.jitter, 0.f, 8.f);
-        if (jitter > 0.f) {
-            static uint32_t g_JitterSeed = 0x9E3779B9u;
-            g_JitterSeed = g_JitterSeed * 1664525u + 1013904223u;
-            rawDx += ((g_JitterSeed >> 16) & 0xFFFFu) / 32767.5f - 1.f;
-            g_JitterSeed = g_JitterSeed * 1664525u + 1013904223u;
-            rawDy += ((g_JitterSeed >> 16) & 0xFFFFu) / 32767.5f - 1.f;
-            rawDx *= jitter;
-            rawDy *= jitter;
+        if (jitter <= 0.f) return v;
+        static uint32_t g_JitterSeed = 0x9E3779B9u;
+        g_JitterSeed = g_JitterSeed * 1664525u + 1013904223u;
+        v += ((g_JitterSeed >> 16) & 0xFFFFu) / 32767.5f - 1.f;
+        return v * jitter;
+    };
+
+    int moveX = 0, moveY = 0;
+    const float dtSec = std::clamp(aimDt * 0.016666f, 0.001f, 0.1f);
+    const float euroDCutoff = 1.f;
+    const auto oneEuroFilter = [&](float inX, float inY, float minCutoff,
+        float beta, float& outX, float& outY) {
+        if (!g_EuroInit) {
+            g_EuroXPrev = inX;
+            g_EuroYPrev = inY;
+            g_EuroDXPrev = 0.f;
+            g_EuroDYPrev = 0.f;
+            g_EuroInit = true;
         }
+        const float cutoffX = minCutoff + beta * fabsf(g_EuroDXPrev);
+        const float alphaX = 1.f /
+            (1.f + 1.f / (2.f * 3.14159265f * cutoffX * dtSec));
+        outX = alphaX * inX + (1.f - alphaX) * g_EuroXPrev;
+        const float alphaDX = 1.f /
+            (1.f + 1.f / (2.f * 3.14159265f * euroDCutoff * dtSec));
+        g_EuroDXPrev = alphaDX * ((outX - g_EuroXPrev) / dtSec) +
+            (1.f - alphaDX) * g_EuroDXPrev;
+        g_EuroXPrev = outX;
+        const float cutoffY = minCutoff + beta * fabsf(g_EuroDYPrev);
+        const float alphaY = 1.f /
+            (1.f + 1.f / (2.f * 3.14159265f * cutoffY * dtSec));
+        outY = alphaY * inY + (1.f - alphaY) * g_EuroYPrev;
+        const float alphaDY = 1.f /
+            (1.f + 1.f / (2.f * 3.14159265f * euroDCutoff * dtSec));
+        g_EuroDYPrev = alphaDY * ((outY - g_EuroYPrev) / dtSec) +
+            (1.f - alphaDY) * g_EuroDYPrev;
+        g_EuroYPrev = outY;
+    };
+    if (aimSettings.aimMode == AIM_SMOOTH_SPRING_DAMPER) {
+        const float omega =
+            2.f * 3.14159265f * (2.4f / smoothFactor);
+        const float k = omega * omega;
+        const float c = 2.f * omega * 0.95f;
+        const float springTargetX = jitterize(pixelDx) * nearScale;
+        const float springTargetY = jitterize(pixelDy) * nearScale;
+        g_SpringVelX +=
+            (k * (springTargetX - g_SpringPosX) - c * g_SpringVelX) * aimDt;
+        g_SpringVelY +=
+            (k * (springTargetY - g_SpringPosY) - c * g_SpringVelY) * aimDt;
+        g_SpringPosX += g_SpringVelX * aimDt;
+        g_SpringPosY += g_SpringVelY * aimDt;
+        moveX = static_cast<int>(roundf(g_SpringPosX));
+        moveY = static_cast<int>(roundf(g_SpringPosY));
+        g_SpringPosX -= static_cast<float>(moveX);
+        g_SpringPosY -= static_cast<float>(moveY);
+    } else if (aimSettings.aimMode == AIM_SMOOTH_ONE_EURO) {
+        float filteredX = 0.f, filteredY = 0.f;
+        oneEuroFilter(jitterize(bestScreen.x), jitterize(bestScreen.y),
+            2.f / smoothFactor, 0.7f, filteredX, filteredY);
+        g_ResidualX += filteredX - centerX;
+        g_ResidualY += filteredY - centerY;
+        moveX = static_cast<int>(roundf(g_ResidualX));
+        moveY = static_cast<int>(roundf(g_ResidualY));
+    } else if (aimSettings.aimMode == AIM_SMOOTH_COMBO) {
+        float filteredX = 0.f, filteredY = 0.f;
+        oneEuroFilter(jitterize(bestScreen.x), jitterize(bestScreen.y),
+            1.5f / smoothFactor, 0.6f, filteredX, filteredY);
+        const float omega =
+            2.f * 3.14159265f * (2.0f / smoothFactor);
+        const float k = omega * omega;
+        const float c = 2.f * omega * 0.9f;
+        const float comboErrX = (filteredX - centerX) * nearScale;
+        const float comboErrY = (filteredY - centerY) * nearScale;
+        g_SpringVelX +=
+            (k * (comboErrX - g_SpringPosX) - c * g_SpringVelX) * aimDt;
+        g_SpringVelY +=
+            (k * (comboErrY - g_SpringPosY) - c * g_SpringVelY) * aimDt;
+        g_SpringPosX += g_SpringVelX * aimDt;
+        g_SpringPosY += g_SpringVelY * aimDt;
+        const float ease = std::clamp(aimSettings.ease, 0.01f, 0.95f);
+        const float easeStep = 1.f - powf(1.f - ease, aimDt);
+        g_SmoothVelX += (g_SpringVelX - g_SmoothVelX) * easeStep;
+        g_SmoothVelY += (g_SpringVelY - g_SmoothVelY) * easeStep;
+        g_ResidualX += g_SmoothVelX;
+        g_ResidualY += g_SmoothVelY;
+        moveX = static_cast<int>(roundf(g_ResidualX));
+        moveY = static_cast<int>(roundf(g_ResidualY));
+    } else {
+        float rawDx = jitterize(pixelDx) / smoothFactor * aimDt * nearScale;
+        float rawDy = jitterize(pixelDy) / smoothFactor * aimDt * nearScale;
+
+        const float ease = std::clamp(aimSettings.ease, 0.01f, 0.95f);
+        const float easeStep = 1.f - powf(1.f - ease, aimDt);
+
+        if (rawDx * g_SmoothVelX < 0.f) g_SmoothVelX = 0.f;
+        if (rawDy * g_SmoothVelY < 0.f) g_SmoothVelY = 0.f;
+
+        g_SmoothVelX += (rawDx - g_SmoothVelX) * easeStep;
+        g_SmoothVelY += (rawDy - g_SmoothVelY) * easeStep;
+
+        g_ResidualX += g_SmoothVelX;
+        g_ResidualY += g_SmoothVelY;
+        moveX = static_cast<int>(roundf(g_ResidualX));
+        moveY = static_cast<int>(roundf(g_ResidualY));
     }
-
-    if (rawDx * g_SmoothVelX < 0.f) g_SmoothVelX = 0.f;
-    if (rawDy * g_SmoothVelY < 0.f) g_SmoothVelY = 0.f;
-
-    g_SmoothVelX += (rawDx - g_SmoothVelX) * easeStep;
-    g_SmoothVelY += (rawDy - g_SmoothVelY) * easeStep;
-
-    g_ResidualX += g_SmoothVelX;
-    g_ResidualY += g_SmoothVelY;
-    int moveX = static_cast<int>(roundf(g_ResidualX));
-    int moveY = static_cast<int>(roundf(g_ResidualY));
     if (moveX != 0 || moveY != 0) {
         moveX = std::clamp(moveX, -32, 32);
         moveY = std::clamp(moveY, -32, 32);
@@ -1823,7 +1921,8 @@ static void OverlayLoop(HANDLE hProc) {
                 if (miscSettings.showDamageLog && (generation & 3u) == 0)
                     ReadDamageLog(hProc, clientBase, next->localPawn);
                 if (miscSettings.showBombTimer || espSettings.showBomb)
-                    ReadBombInfo(hProc, clientBase, latestBomb);
+                    ReadBombInfo(hProc, clientBase, next->players,
+                        latestWorldEntities, latestBomb);
                 if (readFinished >= nextWorldScan) {
                     ReadWorldEntities(
                         clientBase,
@@ -2023,8 +2122,9 @@ static void OverlayLoop(HANDLE hProc) {
             {
                 int hbX = bx - 8;
                 DrawHealthBar(hdcMem, hbX, by, bh, p.health, p.maxHealth);
-                DrawArmorBar(hdcMem, hbX - 5, by, bh, p.armor);
             }
+            if (espSettings.shield)
+                DrawArmorBar(hdcMem, bx + bw + 3, by, bh, p.armor);
 
             if (espSettings.name && !p.name.empty())
             {
@@ -2102,36 +2202,16 @@ static void OverlayLoop(HANDLE hProc) {
             DrawCrosshair(hdcMem, sw, sh);
         }
 
-        if (miscSettings.showGameInfo)
-        {
-            const int infoX = 20;
-            const int infoY = std::clamp(
-                static_cast<int>(sh * 0.30f), 270, 410);
-            wchar_t info[128] = {};
-            swprintf_s(info, L"FPS: %.1f", displayedFps);
-            DrawText(hdcMem, infoX, infoY, RGB(90, 230, 255), info);
-            swprintf_s(
-                info,
-                L"Players: %d / %zu",
-                rendered,
-                players.size());
-            DrawText(hdcMem, infoX, infoY + 18, RGB(225, 225, 230), info);
-            swprintf_s(
-                info,
-                L"Kernel: %.2f ms @ %.1f Hz | Present: %.2f ms",
-                displayedReadMs,
-                displayedSnapshotHz,
-                displayedPresentMs);
-            DrawText(hdcMem, infoX, infoY + 36, RGB(170, 170, 180), info);
-        }
-
-        if (miscSettings.showBombTimer)
         {
             const BombInfo emptyBomb = {};
-            DrawBombTimer(
-                hdcMem,
-                sw,
-                sh,
+            HudUpdate(
+                miscSettings.showGameInfo,
+                miscSettings.showBombTimer,
+                displayedFps,
+                (int)players.size(),
+                displayedReadMs,
+                displayedSnapshotHz,
+                displayedPresentMs,
                 snapshot ? snapshot->bomb : emptyBomb);
         }
 
@@ -2215,7 +2295,9 @@ static void OverlayLoop(HANDLE hProc) {
     EspLog("[OverlayLoop] thread exit");
 }
 
-static void ReadBombInfo(HANDLE hProc, uintptr_t client, BombInfo& out) {
+static void ReadBombInfo(HANDLE hProc, uintptr_t client,
+    const std::vector<PlayerEnt>& players,
+    const std::vector<WorldEnt>& worldEntities, BombInfo& out) {
     if (!hProc || !client) return;
 
     static std::chrono::steady_clock::time_point nextProbe = {};
@@ -2252,7 +2334,28 @@ static void ReadBombInfo(HANDLE hProc, uintptr_t client, BombInfo& out) {
     uintptr_t planted = 0;
     memcpy(&planted, plantedResult[0].data(), sizeof(planted));
     if (!planted) {
-        out = {};
+        BombInfo worldState = {};
+        for (const auto& world : worldEntities) {
+            if (world.type != ENT_BOMB) continue;
+            if (world.owner) {
+                worldState.carried = true;
+                for (const auto& player : players) {
+                    if (player.pawn == world.owner) {
+                        worldState.carrierTeam = player.team;
+                        break;
+                    }
+                }
+                break;
+            }
+            worldState.dropped = true;
+        }
+        if (worldState.dropped ||
+            (worldState.carried && worldState.carrierTeam == 3))
+        {
+            worldState.sampledAtMs = GetTickCount64();
+            worldState.valid = true;
+        }
+        out = worldState;
         trackedBomb = 0;
         trackedTimerLength = 0.f;
         trackedAt = {};

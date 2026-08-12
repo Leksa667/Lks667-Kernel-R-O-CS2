@@ -117,6 +117,9 @@ struct WorldEnt {
 
 struct BombInfo {
     bool planted = false;
+    bool carried = false;
+    bool dropped = false;
+    int carrierTeam = 0;
     bool defused = false;
     int site = -1;
     float timer = 0.f;
@@ -162,7 +165,9 @@ enum BoxStyle : int {
     BOX_FULL_3D = 2,
     BOX_CORNER_3D = 3,
     BOX_ROUNDED_2D = 4,
-    BOX_STYLE_COUNT = 5
+    BOX_FILLED_2D = 5,
+    BOX_CIRCLE_2D = 6,
+    BOX_STYLE_COUNT = 7
 };
 
 struct EspSettings {
@@ -171,6 +176,7 @@ struct EspSettings {
     bool skeleton = true;
     bool headEsp = true;
     bool health = true;
+    bool shield = false;
     bool name = true;
     bool visibleOnly = false;
     bool showBomb = true;
@@ -200,10 +206,18 @@ struct EspSettings {
     int boxStyle = 0;
 };
 
+enum AimSmoothMode : int {
+    AIM_SMOOTH_EASE_OUT = 0,
+    AIM_SMOOTH_SPRING_DAMPER = 1,
+    AIM_SMOOTH_ONE_EURO = 2,
+    AIM_SMOOTH_COMBO = 3
+};
+
 struct AimSettings {
     bool enabled = false;
     int aimKey = 0x06;
     int aimBone = 7;
+    int aimMode = AIM_SMOOTH_EASE_OUT;
     float aimFov = 8.f;
     float aimSmooth = 5.f;
     bool visibleOnly = false;
@@ -266,7 +280,9 @@ extern std::vector<DamageEvent> g_DamageLog;
 
 void StartOverlay(HANDLE hProcess);
 void StopOverlay();
-void ReadBombInfo(HANDLE hProc, uintptr_t client, BombInfo& out);
+void ReadBombInfo(HANDLE hProc, uintptr_t client,
+    const std::vector<PlayerEnt>& players,
+    const std::vector<WorldEnt>& worldEntities, BombInfo& out);
 void DrawBombTimer(HDC dc, int sw, int sh, const BombInfo& bomb);
 void DrawCrosshair(HDC dc, int sw, int sh);
 void ReadDamageLog(HANDLE hProc, uintptr_t client, uintptr_t localPawn);

@@ -26,6 +26,7 @@
 #include "cs2dumper/analysis/analyze.hpp"
 #include "cs2dumper/memory/process.hpp"
 #include "overlay.hpp"
+#include "hud_window.hpp"
 #include "driver_loader.hpp"
 #include "modern_ui.hpp"
 
@@ -362,7 +363,7 @@ static LRESULT CALLBACK EspPageSubclass(HWND hwnd, UINT msg, WPARAM w, LPARAM l,
 }
 
 
-static HWND g_hChkBox, g_hChkSkel, g_hChkHead, g_hChkHealth, g_hChkName, g_hChkVisible;
+static HWND g_hChkBox, g_hChkSkel, g_hChkHead, g_hChkHealth, g_hChkShield, g_hChkName, g_hChkVisible;
 static HWND g_hChkEspEnable;
 static HWND g_hChkWeapons, g_hChkGrenades, g_hChkBombEsp;
 static HWND g_hComboStyle;
@@ -407,36 +408,40 @@ static void CreateEspControls(HWND parent) {
     SendMessage(g_hChkHead, BM_SETCHECK, g_EspSettings.headEsp ? BST_CHECKED : BST_UNCHECKED, 0);
     g_hChkHealth = mkchk(L"Health bar", 102, left, 168);
     SendMessage(g_hChkHealth, BM_SETCHECK, g_EspSettings.health ? BST_CHECKED : BST_UNCHECKED, 0);
-    g_hChkName = mkchk(L"Player name", 103, left, 196);
+    g_hChkShield = mkchk(L"Shield / Armor", 113, left, 196);
+    SendMessage(g_hChkShield, BM_SETCHECK, g_EspSettings.shield ? BST_CHECKED : BST_UNCHECKED, 0);
+    g_hChkName = mkchk(L"Player name", 103, left, 224);
     SendMessage(g_hChkName, BM_SETCHECK, g_EspSettings.name ? BST_CHECKED : BST_UNCHECKED, 0);
-    g_hChkVisible = mkchk(L"Visible only", 104, left, 224);
+    g_hChkVisible = mkchk(L"Visible only", 104, left, 252);
     SendMessage(g_hChkVisible, BM_SETCHECK, g_EspSettings.visibleOnly ? BST_CHECKED : BST_UNCHECKED, 0);
 
     CreateWindow(L"STATIC", L"Box style:", WS_CHILD | WS_VISIBLE,
-        left, 270, 100, 22, parent, 0, 0, 0);
+        left, 298, 100, 22, parent, 0, 0, 0);
     g_hComboStyle = CreateWindow(WC_COMBOBOXW, L"",
         WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-        left + 100, 268, 155, 150, parent, (HMENU)106, 0, 0);
+        left + 100, 296, 155, 150, parent, (HMENU)106, 0, 0);
     SendMessage(g_hComboStyle, CB_ADDSTRING, 0, (LPARAM)L"2D Corner");
     SendMessage(g_hComboStyle, CB_ADDSTRING, 0, (LPARAM)L"2D Full");
     SendMessage(g_hComboStyle, CB_ADDSTRING, 0, (LPARAM)L"3D Full");
     SendMessage(g_hComboStyle, CB_ADDSTRING, 0, (LPARAM)L"3D Corner");
     SendMessage(g_hComboStyle, CB_ADDSTRING, 0, (LPARAM)L"2D Rounded");
+    SendMessage(g_hComboStyle, CB_ADDSTRING, 0, (LPARAM)L"2D Filled");
+    SendMessage(g_hComboStyle, CB_ADDSTRING, 0, (LPARAM)L"2D Circle");
     SendMessage(g_hComboStyle, CB_SETCURSEL, g_EspSettings.boxStyle, 0);
     CreateWindow(L"STATIC", L"Box color:", WS_CHILD | WS_VISIBLE,
-        left, 306, 100, 22, parent, 0, 0, 0);
+        left, 334, 100, 22, parent, 0, 0, 0);
     g_hBtnColorBox = CreateWindow(L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-        left + 100, 304, 40, 24, parent, (HMENU)200, 0, 0);
+        left + 100, 332, 40, 24, parent, (HMENU)200, 0, 0);
     CreateWindow(L"STATIC", L"Visible color:", WS_CHILD | WS_VISIBLE,
-        left, 338, 110, 22, parent, 0, 0, 0);
+        left, 366, 110, 22, parent, 0, 0, 0);
     g_hBtnSkelVisible = CreateWindow(L"BUTTON", L"",
         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-        left + 110, 336, 40, 24, parent, (HMENU)203, 0, 0);
+        left + 110, 364, 40, 24, parent, (HMENU)203, 0, 0);
     CreateWindow(L"STATIC", L"Hidden color:", WS_CHILD | WS_VISIBLE,
-        left, 370, 110, 22, parent, 0, 0, 0);
+        left, 398, 110, 22, parent, 0, 0, 0);
     g_hBtnSkelHidden = CreateWindow(L"BUTTON", L"",
         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-        left + 110, 368, 40, 24, parent, (HMENU)204, 0, 0);
+        left + 110, 396, 40, 24, parent, (HMENU)204, 0, 0);
 
     g_hChkWeapons = mkchk(L"Weapon ESP", 109, right, 52);
     SendMessage(g_hChkWeapons, BM_SETCHECK,
@@ -748,6 +753,7 @@ static void SaveConfig() {
     f << "skeleton=" << g_EspSettings.skeleton << "\n";
     f << "headEsp=" << g_EspSettings.headEsp << "\n";
     f << "health=" << g_EspSettings.health << "\n";
+    f << "shield=" << g_EspSettings.shield << "\n";
     f << "name=" << g_EspSettings.name << "\n";
     f << "visibleOnly=" << g_EspSettings.visibleOnly << "\n";
     f << "showFovCircle=" << g_EspSettings.showFovCircle << "\n";
@@ -767,6 +773,7 @@ static void SaveConfig() {
     f << "aimBone=" << g_AimSettings.aimBone << "\n";
     f << "aimFov=" << g_AimSettings.aimFov << "\n";
     f << "aimSmooth=" << g_AimSettings.aimSmooth << "\n";
+    f << "aimMode=" << g_AimSettings.aimMode << "\n";
     f << "teamCheck=" << g_AimSettings.teamCheck << "\n";
     f << "visibleOnly=" << g_AimSettings.visibleOnly << "\n";
     f << "humanize=" << g_AimSettings.humanize << "\n";
@@ -805,6 +812,7 @@ static void LoadConfig() {
             else if (key == "skeleton") g_EspSettings.skeleton = (val == "1");
             else if (key == "headEsp") g_EspSettings.headEsp = (val == "1");
             else if (key == "health") g_EspSettings.health = (val == "1");
+            else if (key == "shield") g_EspSettings.shield = (val == "1");
             else if (key == "name") g_EspSettings.name = (val == "1");
             else if (key == "visibleOnly") g_EspSettings.visibleOnly = (val == "1");
             else if (key == "showFovCircle") g_EspSettings.showFovCircle = (val == "1");
@@ -836,6 +844,9 @@ static void LoadConfig() {
             else if (key == "aimBone") g_AimSettings.aimBone = std::stoi(val);
             else if (key == "aimFov") g_AimSettings.aimFov = std::stof(val);
             else if (key == "aimSmooth") g_AimSettings.aimSmooth = std::stof(val);
+            else if (key == "aimMode")
+                g_AimSettings.aimMode =
+                    std::clamp(std::stoi(val), (int)AIM_SMOOTH_EASE_OUT, (int)AIM_SMOOTH_COMBO);
             else if (key == "teamCheck") g_AimSettings.teamCheck = (val == "1");
             else if (key == "visibleOnly") g_AimSettings.visibleOnly = (val == "1");
             else if (key == "humanize") g_AimSettings.humanize = (val == "1");
@@ -851,6 +862,7 @@ static void LoadConfig() {
         }
     }
     SetStatus(L"[+] Config loaded");
+    HudRefresh();
 }
 
 
@@ -869,6 +881,7 @@ static void SyncControlsFromSettings() {
     setCheck(g_hChkSkel, g_EspSettings.skeleton);
     setCheck(g_hChkHead, g_EspSettings.headEsp);
     setCheck(g_hChkHealth, g_EspSettings.health);
+    setCheck(g_hChkShield, g_EspSettings.shield);
     setCheck(g_hChkName, g_EspSettings.name);
     setCheck(g_hChkVisible, g_EspSettings.visibleOnly);
     setCheck(g_hChkFovCircle, g_EspSettings.showFovCircle);
@@ -1316,6 +1329,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CLOSE:
         if (!g_Closing) {
             g_Closing = true;
+            HudDestroy();
             KillTimer(h, FADE_TIMER_ID);
             KillTimer(h, STARTUP_SOUND_TIMER_ID);
             g_ExitInitialAlpha = g_CurrentAlpha;
@@ -1493,6 +1507,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 case 100: g_EspSettings.box = chk; break;
                 case 101: g_EspSettings.skeleton = chk; break;
                 case 102: g_EspSettings.health = chk; break;
+                case 113: g_EspSettings.shield = chk; break;
                 case 103: g_EspSettings.name = chk; break;
                 case 104: g_EspSettings.visibleOnly = chk; break;
                 case 105: g_EspSettings.enabled = chk; break;
@@ -1521,6 +1536,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 case 404: g_MiscSettings.showBombTimer = chk; break;
                 case 405: g_MiscSettings.showDamageLog = chk; break;
                 }
+                HudRefresh();
             }
             if (id == 500) SaveConfig();
             if (id == 501) {
@@ -1532,6 +1548,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 g_AimSettings = AimSettings{};
                 g_MiscSettings = MiscSettings{};
                 SyncControlsFromSettings();
+                HudRefresh();
                 SetStatus(L"[+] Defaults reset");
             }
             if (id == 503) {
@@ -1786,6 +1803,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int show) {
     SetTimer(g_hWnd, FADE_TIMER_ID, 16, nullptr);
     SetTimer(g_hWnd, STARTUP_SOUND_TIMER_ID, 1300, nullptr);
 
+    HudCreate(hInst, ConfigFolder().wstring());
+
     MSG msg;
     while (GetMessage(&msg, 0, 0, 0)) {
         TranslateMessage(&msg); DispatchMessage(&msg);
@@ -1795,6 +1814,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int show) {
     StopOverlay();
     g_UseKernelRead.store(false, std::memory_order_release);
     g_Client.Shutdown();
+    HudDestroy();
     lks::modern_ui::shutdown();
     if (g_FontCons) DeleteObject(g_FontCons);
     if (g_FontSegoe) DeleteObject(g_FontSegoe);

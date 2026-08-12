@@ -82,8 +82,9 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="main.cpp" />
+<ClCompile Include="main.cpp" />
     <ClCompile Include="modern_ui.cpp" />
+    <ClCompile Include="hud_window.cpp" />
     <ClCompile Include="ui_render.cpp" />
     <ClCompile Include="overlay.cpp" />
     <ClCompile Include="driver_loader.cpp" />
@@ -94,8 +95,9 @@
     <ClCompile Include="third_party\kdmapper\utils.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="LksClient.hpp" />
+<ClInclude Include="LksClient.hpp" />
     <ClInclude Include="modern_ui.hpp" />
+    <ClInclude Include="hud_window.hpp" />
     <ClInclude Include="ui_render.hpp" />
     <ClInclude Include="ui_theme.hpp" />
     <ClInclude Include="overlay.hpp" />
