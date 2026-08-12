@@ -5,9 +5,12 @@
 // =============================================================================
 
 #include <windows.h>
+#include <windowsx.h>
+#include <mmsystem.h>
 #include <commdlg.h>
 #include <commctrl.h>
 #include <uxtheme.h>
+#include <dwmapi.h>
 #include <shlobj.h>
 #include <string>
 #include <vector>
@@ -24,11 +27,14 @@
 #include "cs2dumper/memory/process.hpp"
 #include "overlay.hpp"
 #include "driver_loader.hpp"
+#include "modern_ui.hpp"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "winmm.lib")
 
 HWND g_hWnd; static HWND g_hTab, g_hTabEsp;
 static HWND g_hClose, g_hMin;
@@ -38,8 +44,191 @@ std::atomic_bool g_UseKernelRead{false};
 std::atomic_bool g_Running{true};
 static std::thread g_DumpWorker;
 static HBRUSH g_BgBrush, g_InputBrush;
-static HFONT g_FontCons, g_FontSegoe;
+static HFONT g_FontCons, g_FontSegoe, g_FontBody, g_FontSmall, g_FontSection;
 static constexpr int MENU_HOTKEY_ID = 0x4C4B;
+static constexpr UINT_PTR FADE_TIMER_ID = 0xFADE;
+static constexpr UINT_PTR STARTUP_SOUND_TIMER_ID = 0x5A11;
+static constexpr UINT_PTR EXIT_FADE_TIMER_ID = 0xE017;
+static DWORD g_FadeStarted = 0;
+static DWORD g_ExitStarted = 0;
+static BYTE g_CurrentAlpha = 0;
+static BYTE g_ExitInitialAlpha = 255;
+static bool g_Closing = false;
+static std::vector<BYTE> g_StartupSound;
+
+static void PlayStartupSound(bool reversed = false) {
+    constexpr int sampleRate = 44100;
+    constexpr float duration = 0.72f;
+    constexpr int samples = static_cast<int>(sampleRate * duration);
+    constexpr int dataBytes = samples * 2;
+    g_StartupSound.clear();
+    g_StartupSound.reserve(44 + dataBytes);
+    const auto bytes = [](auto value, int count, std::vector<BYTE>& out) {
+        for (int i = 0; i < count; ++i)
+            out.push_back(static_cast<BYTE>((value >> (i * 8)) & 0xFF));
+    };
+    const auto tag = [](const char* value, std::vector<BYTE>& out) {
+        for (int i = 0; i < 4; ++i) out.push_back(static_cast<BYTE>(value[i]));
+    };
+    tag("RIFF", g_StartupSound); bytes(36 + dataBytes, 4, g_StartupSound);
+    tag("WAVE", g_StartupSound); tag("fmt ", g_StartupSound);
+    bytes(16, 4, g_StartupSound); bytes(1, 2, g_StartupSound);
+    bytes(1, 2, g_StartupSound); bytes(sampleRate, 4, g_StartupSound);
+    bytes(sampleRate * 2, 4, g_StartupSound); bytes(2, 2, g_StartupSound);
+    bytes(16, 2, g_StartupSound); tag("data", g_StartupSound);
+    bytes(dataBytes, 4, g_StartupSound);
+    for (int i = 0; i < samples; ++i) {
+        const float t = static_cast<float>(i) / sampleRate;
+        const float attack = std::min(1.0f, t / 0.055f);
+        const float release = std::clamp((duration - t) / 0.42f, 0.0f, 1.0f);
+        const float envelope = attack * release * release;
+        const float shimmer = 0.58f * std::sin(2.0f * 3.14159265f * 523.25f * t) +
+                              0.27f * std::sin(2.0f * 3.14159265f * 659.25f * t) +
+                              0.15f * std::sin(2.0f * 3.14159265f * 783.99f * t);
+        const short sample = static_cast<short>(shimmer * envelope * 5600.0f);
+        bytes(static_cast<unsigned short>(sample), 2, g_StartupSound);
+    }
+    if (reversed) {
+        for (int left = 44, right = 44 + dataBytes - 2; left < right;
+             left += 2, right -= 2) {
+            std::swap(g_StartupSound[left], g_StartupSound[right]);
+            std::swap(g_StartupSound[left + 1], g_StartupSound[right + 1]);
+        }
+    }
+    PlaySoundW(reinterpret_cast<LPCWSTR>(g_StartupSound.data()), nullptr,
+               SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+}
+
+namespace Ui {
+constexpr COLORREF App = RGB(10, 12, 17);
+constexpr COLORREF Rail = RGB(14, 18, 25);
+constexpr COLORREF Canvas = RGB(16, 20, 27);
+constexpr COLORREF Surface = RGB(22, 28, 37);
+constexpr COLORREF SurfaceHover = RGB(29, 37, 49);
+constexpr COLORREF Stroke = RGB(34, 43, 55);
+constexpr COLORREF StrokeStrong = RGB(51, 64, 79);
+constexpr COLORREF TextHi = RGB(243, 246, 251);
+constexpr COLORREF Text = RGB(191, 200, 214);
+constexpr COLORREF TextDim = RGB(122, 134, 152);
+constexpr COLORREF Accent = RGB(30, 215, 96);
+constexpr COLORREF AccentHi = RGB(77, 234, 136);
+constexpr COLORREF AccentInk = RGB(4, 34, 14);
+constexpr COLORREF Danger = RGB(237, 66, 69);
+
+static void RoundFill(HDC dc, const RECT& rc, int radius, COLORREF color) {
+    HBRUSH brush = CreateSolidBrush(color);
+    HPEN pen = CreatePen(PS_SOLID, 1, color);
+    const auto oldBrush = SelectObject(dc, brush);
+    const auto oldPen = SelectObject(dc, pen);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    SelectObject(dc, oldPen); SelectObject(dc, oldBrush);
+    DeleteObject(pen); DeleteObject(brush);
+}
+
+static void RoundFrame(HDC dc, const RECT& rc, int radius, COLORREF color) {
+    HPEN pen = CreatePen(PS_SOLID, 1, color);
+    const auto oldPen = SelectObject(dc, pen);
+    const auto oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    SelectObject(dc, oldBrush); SelectObject(dc, oldPen); DeleteObject(pen);
+}
+
+static bool IsCheckId(int id) {
+    return (id >= 100 && id <= 111 && id != 106) ||
+           (id >= 300 && id <= 311 && id != 301 && id != 302 &&
+            id != 303 && id != 304 && id != 307 && id != 308 &&
+            id != 309 && id != 310) || (id >= 402 && id <= 405);
+}
+
+static bool IsColorId(int id) { return id >= 200 && id <= 204; }
+
+static COLORREF ColorForId(int id);
+
+static bool DrawControl(const DRAWITEMSTRUCT* di) {
+    if (!di || di->CtlType != ODT_BUTTON) return false;
+    RECT rc = di->rcItem;
+    const int id = static_cast<int>(di->CtlID);
+    const bool hot = GetPropW(di->hwndItem, L"LksHot") != nullptr;
+    const bool pressed = (di->itemState & ODS_SELECTED) != 0;
+    SetBkMode(di->hDC, TRANSPARENT);
+
+    if (IsColorId(id)) {
+        RoundFill(di->hDC, rc, 10, Surface);
+        RECT swatch = rc; InflateRect(&swatch, -4, -4);
+        RoundFill(di->hDC, swatch, 8, ColorForId(id));
+        RoundFrame(di->hDC, rc, 10, hot ? Accent : StrokeStrong);
+        return true;
+    }
+
+    wchar_t label[128] = {};
+    GetWindowTextW(di->hwndItem, label, static_cast<int>(_countof(label)));
+    if (IsCheckId(id)) {
+        const bool checked = SendMessageW(di->hwndItem, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        RECT track{rc.right - 48, rc.top + (rc.bottom - rc.top - 24) / 2,
+                   rc.right - 4, rc.top + (rc.bottom - rc.top + 24) / 2};
+        SetTextColor(di->hDC, checked ? TextHi : Text);
+        SelectObject(di->hDC, g_FontBody);
+        RECT textRc = rc; textRc.right = track.left - 12;
+        DrawTextW(di->hDC, label, -1, &textRc,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        RoundFill(di->hDC, track, 24, checked ? Accent : (hot ? StrokeStrong : Stroke));
+        RECT knob = track;
+        knob.left = checked ? track.right - 21 : track.left + 3;
+        knob.right = knob.left + 18; knob.top += 3; knob.bottom -= 3;
+        HBRUSH kb = CreateSolidBrush(checked ? AccentInk : TextDim);
+        const auto old = SelectObject(di->hDC, kb);
+        Ellipse(di->hDC, knob.left, knob.top, knob.right, knob.bottom);
+        SelectObject(di->hDC, old); DeleteObject(kb);
+        return true;
+    }
+
+    const bool primary = id == 500;
+    const bool destructive = id == 502 || id == 503;
+    COLORREF fill = primary ? Accent : Surface;
+    if (hot) fill = primary ? AccentHi : SurfaceHover;
+    if (pressed) fill = primary ? Accent : StrokeStrong;
+    RoundFill(di->hDC, rc, 10, fill);
+    if (!primary) RoundFrame(di->hDC, rc, 10, destructive && hot ? Danger : StrokeStrong);
+    SelectObject(di->hDC, g_FontBody);
+    SetTextColor(di->hDC, primary ? AccentInk : (destructive && hot ? Danger : TextHi));
+    DrawTextW(di->hDC, label, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    return true;
+}
+
+static LRESULT CALLBACK ControlSubclass(HWND hwnd, UINT msg, WPARAM w, LPARAM l,
+                                        UINT_PTR, DWORD_PTR) {
+    switch (msg) {
+    case WM_MOUSEMOVE:
+        if (!GetPropW(hwnd, L"LksHot")) {
+            SetPropW(hwnd, L"LksHot", reinterpret_cast<HANDLE>(1));
+            TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&tme); InvalidateRect(hwnd, nullptr, TRUE);
+        }
+        break;
+    case WM_MOUSELEAVE:
+        RemovePropW(hwnd, L"LksHot"); InvalidateRect(hwnd, nullptr, TRUE); break;
+    case WM_NCDESTROY:
+        RemovePropW(hwnd, L"LksHot"); RemoveWindowSubclass(hwnd, ControlSubclass, 1); break;
+    }
+    return DefSubclassProc(hwnd, msg, w, l);
+}
+
+static void StyleChildren(HWND parent) {
+    EnumChildWindows(parent, [](HWND child, LPARAM) -> BOOL {
+        wchar_t cls[32] = {}; GetClassNameW(child, cls, 32);
+        SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(g_FontBody), TRUE);
+        if (_wcsicmp(cls, L"Button") == 0) {
+            const auto style = GetWindowLongPtrW(child, GWL_STYLE);
+            SetWindowLongPtrW(child, GWL_STYLE,
+                (style & ~BS_TYPEMASK) | BS_OWNERDRAW);
+            SetWindowSubclass(child, ControlSubclass, 1, 0);
+        } else if (_wcsicmp(cls, L"Edit") == 0 || _wcsicmp(cls, L"ComboBox") == 0) {
+            SetWindowTheme(child, L"DarkMode_Explorer", nullptr);
+        }
+        return TRUE;
+    }, 0);
+}
+} // namespace Ui
 
 std::vector<OffsetEntry> g_Offsets;
 extern EspSettings g_EspSettings;
@@ -47,18 +236,21 @@ extern AimSettings g_AimSettings;
 extern MiscSettings g_MiscSettings;
 extern ConfigSettings g_ConfigSettings;
 
-static void SetStatus(const wchar_t* s) { SetWindowText(g_hStatus, s); }
+static void SetStatus(const wchar_t* s) {
+    SetWindowText(g_hStatus, s);
+    if (g_hWnd) InvalidateRect(g_hWnd, nullptr, FALSE);
+}
 
 
 static void DrawBtnIcon(HDC dc, RECT rc, int type) {
     HDC mem = CreateCompatibleDC(dc);
     HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right - rc.left, rc.bottom - rc.top);
     HGDIOBJ oldBitmap = SelectObject(mem, bmp);
-    SetBkColor(mem, RGB(30, 30, 35));
+    SetBkColor(mem, Ui::Rail);
     RECT r = {0, 0, rc.right - rc.left, rc.bottom - rc.top};
     ExtTextOut(mem, 0, 0, ETO_OPAQUE, &r, nullptr, 0, nullptr);
     int cx = r.right / 2, cy = r.bottom / 2;
-    HPEN pen = CreatePen(PS_SOLID, 2, type == 0 ? RGB(220, 50, 50) : RGB(180, 180, 180));
+    HPEN pen = CreatePen(PS_SOLID, 2, type == 0 ? Ui::Danger : Ui::TextDim);
     HGDIOBJ oldPen = SelectObject(mem, pen);
     if (type == 0) {
         MoveToEx(mem, cx - 5, cy - 5, 0); LineTo(mem, cx + 5, cy + 5);
@@ -104,6 +296,16 @@ static COLORREF g_TempSkelVisibleCol = RGB(60, 230, 110);
 static COLORREF g_TempSkelHiddenCol = RGB(235, 70, 70);
 static COLORREF g_TempFovCol = RGB(110, 190, 255);
 
+COLORREF Ui::ColorForId(int id) {
+    switch (id) {
+    case 200: return g_TempBoxCol;
+    case 201: return g_TempSkelCol;
+    case 202: return g_TempFovCol;
+    case 203: return g_TempSkelVisibleCol;
+    default: return g_TempSkelHiddenCol;
+    }
+}
+
 static LRESULT CALLBACK TabSubclass(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
     switch (msg) {
     case WM_ERASEBKGND: {
@@ -113,7 +315,7 @@ static LRESULT CALLBACK TabSubclass(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UIN
     }
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)w; SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(180, 180, 180));
+        SetTextColor(dc, Ui::Text);
         return (LRESULT)g_BgBrush;
     }
     }
@@ -123,6 +325,16 @@ static LRESULT CALLBACK TabSubclass(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UIN
 
 static LRESULT CALLBACK EspPageSubclass(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
     switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps{}; HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc{}; GetClientRect(hwnd, &rc);
+        FillRect(dc, &rc, g_BgBrush);
+        RECT card{18, 12, rc.right - 18, rc.bottom - 14};
+        Ui::RoundFill(dc, card, 18, Ui::Surface);
+        Ui::RoundFrame(dc, card, 18, Ui::Stroke);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
     case WM_ERASEBKGND: {
         RECT rc; GetClientRect(hwnd, &rc);
         FillRect((HDC)w, &rc, g_BgBrush);
@@ -131,32 +343,18 @@ static LRESULT CALLBACK EspPageSubclass(HWND hwnd, UINT msg, WPARAM w, LPARAM l,
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLORBTN: {
         HDC dc = (HDC)w; SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(180, 180, 180));
+        SetTextColor(dc, Ui::Text);
         return (LRESULT)g_BgBrush;
     }
     case WM_CTLCOLORLISTBOX:
     case WM_CTLCOLOREDIT: {
-        HDC dc = (HDC)w; SetBkColor(dc, RGB(27, 31, 39));
-        SetTextColor(dc, RGB(200, 200, 200));
+        HDC dc = (HDC)w; SetBkColor(dc, Ui::Surface);
+        SetTextColor(dc, Ui::TextHi);
         return (LRESULT)g_InputBrush;
     }
     case WM_DRAWITEM: {
         DRAWITEMSTRUCT* di = (DRAWITEMSTRUCT*)l;
-        if (di->CtlType == ODT_BUTTON &&
-            (di->CtlID >= 200 && di->CtlID <= 204)) {
-            COLORREF c = di->CtlID == 200 ? g_TempBoxCol :
-                di->CtlID == 201 ? g_TempSkelCol :
-                di->CtlID == 202 ? g_TempFovCol :
-                di->CtlID == 203 ? g_TempSkelVisibleCol :
-                g_TempSkelHiddenCol;
-            HBRUSH br = CreateSolidBrush(c);
-            RECT r = di->rcItem;
-            InflateRect(&r, -2, -2);
-            FillRect(di->hDC, &r, br);
-            FrameRect(di->hDC, &r, (HBRUSH)GetStockObject(WHITE_BRUSH));
-            DeleteObject(br);
-            return TRUE;
-        }
+        if (Ui::DrawControl(di)) return TRUE;
     } return TRUE;
     case WM_COMMAND: return SendMessage(g_hWnd, WM_COMMAND, w, l);
     }
@@ -178,7 +376,7 @@ static HWND g_hEditFov, g_hEditSmooth, g_hEditReaction, g_hEditJitter, g_hEditEa
 static HWND g_hTabMisc, g_hTabConfig;
 static HWND g_hChkCrosshair, g_hChkGameInfo, g_hChkBombTimer, g_hChkDamageLog;
 static HWND g_hBtnSave, g_hBtnLoad, g_hBtnReset, g_hConfigPath;
-static bool g_ListeningForKey = false;
+bool g_ListeningForKey = false;
 static bool g_KeyCaptureArmed = false;
 static std::wstring AppFolder();
 static std::filesystem::path ConfigFolder();
@@ -341,6 +539,7 @@ static void FinishKeyCapture(int virtualKey) {
     g_KeyCaptureArmed = false;
     KillTimer(g_hWnd, 0x4B);
     UpdateKeyButton();
+    InvalidateRect(g_hWnd, nullptr, FALSE);
 }
 
 static void BeginKeyCapture() {
@@ -349,6 +548,7 @@ static void BeginKeyCapture() {
     SetWindowText(g_hBtnKey, L"Press a key...");
     SetFocus(g_hWnd);
     SetTimer(g_hWnd, 0x4B, 10, nullptr);
+    InvalidateRect(g_hWnd, nullptr, FALSE);
 }
 
 
@@ -516,6 +716,28 @@ static void RefreshConfigList() {
     SetWindowTextW(g_hConfigPath, selected.c_str());
 }
 
+std::vector<std::wstring> ModernConfigNames() {
+    std::vector<std::wstring> names;
+    WIN32_FIND_DATAW data{};
+    const std::wstring pattern = (ConfigFolder() / L"*.cfg").wstring();
+    HANDLE search = FindFirstFileW(pattern.c_str(), &data);
+    if (search != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                names.emplace_back(data.cFileName);
+        } while (FindNextFileW(search, &data));
+        FindClose(search);
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+std::wstring ModernSelectedConfig() { return SelectedConfigName(); }
+
+void ModernSelectConfig(const std::wstring& name) {
+    if (g_hConfigPath) SetWindowTextW(g_hConfigPath, name.c_str());
+}
+
 static void SaveConfig() {
     const auto path = ConfigPath();
     std::ofstream f(path);
@@ -532,6 +754,7 @@ static void SaveConfig() {
     f << "showWeapons=" << g_EspSettings.showWeapons << "\n";
     f << "showGrenades=" << g_EspSettings.showGrenades << "\n";
     f << "showBomb=" << g_EspSettings.showBomb << "\n";
+    f << "showChickens=" << g_EspSettings.showChickens << "\n";
     f << "boxStyle=" << g_EspSettings.boxStyle << "\n";
     f << "boxColor=" << static_cast<unsigned long>(g_EspSettings.boxColor) << "\n";
     f << "skeletonColor=" << static_cast<unsigned long>(g_EspSettings.skeletonColor) << "\n";
@@ -588,6 +811,7 @@ static void LoadConfig() {
             else if (key == "showWeapons") g_EspSettings.showWeapons = (val == "1");
             else if (key == "showGrenades") g_EspSettings.showGrenades = (val == "1");
             else if (key == "showBomb") g_EspSettings.showBomb = (val == "1");
+            else if (key == "showChickens") g_EspSettings.showChickens = (val == "1");
             else if (key == "boxStyle")
                 g_EspSettings.boxStyle =
                     std::clamp(std::stoi(val), 0, BOX_STYLE_COUNT - 1);
@@ -852,6 +1076,31 @@ static bool LoadOffsetCache(uint32_t fingerprint) {
     return true;
 }
 
+static bool WaitWhileRunning(DWORD milliseconds) {
+    const DWORD started = GetTickCount();
+    while (g_Running.load(std::memory_order_acquire)) {
+        const DWORD elapsed = GetTickCount() - started;
+        if (elapsed >= milliseconds) return true;
+        Sleep(std::min<DWORD>(50, milliseconds - elapsed));
+    }
+    return false;
+}
+
+static void RegisterControllerWithDriver() {
+    const HWND hwnd = g_hWnd;
+    if (!hwnd || !IsWindow(hwnd) || !g_Client.GetProcessHandle()) return;
+    DWORD controllerPid = 0;
+    const DWORD controllerTid = GetWindowThreadProcessId(hwnd, &controllerPid);
+    if (controllerTid && controllerPid &&
+        g_Client.SendTargetThread(controllerPid, controllerTid)) {
+        EspLog("[Bootstrap] controller registered: PID=%u TID=%u",
+               controllerPid, controllerTid);
+    } else {
+        EspLog("[Bootstrap] controller registration failed: PID=%u TID=%u error=%u",
+               controllerPid, controllerTid, GetLastError());
+    }
+}
+
 static void DumpThread() {
     while (g_Running.load(std::memory_order_acquire)) {
         
@@ -860,7 +1109,7 @@ static void DumpThread() {
         SetStatus(L"[*] Waiting for cs2.exe...");
         while (g_Running.load(std::memory_order_acquire) &&
             g_Client.GetProcessIdByName(L"cs2.exe") == 0)
-            Sleep(2000);
+            WaitWhileRunning(2000);
         if (!g_Running.load(std::memory_order_acquire)) break;
 
         
@@ -871,7 +1120,7 @@ static void DumpThread() {
             if (ProbeDriverAlive(L"cs2.exe")) {
                 EspLog("[Bootstrap] live driver present but unreachable; aborting map");
                 SetStatus(L"[-] Old driver still loaded. Close CS2 once (or reboot) and relaunch.");
-                Sleep(5000);
+                WaitWhileRunning(5000);
                 continue;
             }
             EspLog("[Bootstrap] kernel transport unavailable, mapping driver");
@@ -880,21 +1129,22 @@ static void DumpThread() {
             if (!MapKernelDriver(AppFolder() + L"Lks_KernelDriver.sys", error)) {
                 EspLog("[Bootstrap] driver mapping failed: %ls", error.c_str());
                 SetStatus(L"[-] Driver mapping failed; retrying in 5s...");
-                Sleep(5000);
+                WaitWhileRunning(5000);
                 continue;
             }
             EspLog("[Bootstrap] driver mapped, waiting for transport...");
             SetStatus(L"[*] Waiting for kernel transport...");
-            Sleep(1500);
+            WaitWhileRunning(1500);
             if (!g_Client.Initialize(XorWideString(L"cs2.exe"))) {
                 EspLog("[Bootstrap] transport init failed after mapping");
                 SetStatus(L"[-] Kernel transport failed; retrying in 5s...");
-                Sleep(5000);
+                WaitWhileRunning(5000);
                 continue;
             }
         }
         EspLog("[Bootstrap] connected. hProcess=0x%llX inContext=%d",
             (uintptr_t)g_Client.GetProcessHandle(), g_Client.IsInContext());
+        RegisterControllerWithDriver();
 
         
         const HANDLE hProc = g_Client.GetProcessHandle();
@@ -905,7 +1155,7 @@ static void DumpThread() {
             !fingerprint && attempt < 10;
             ++attempt) {
             fingerprint = GetClientFingerprint(hProc);
-            if (!fingerprint) Sleep(2000);
+            if (!fingerprint) WaitWhileRunning(2000);
         }
         bool offsetsReady = false;
         if (fingerprint && LoadOffsetCache(fingerprint)) {
@@ -960,7 +1210,7 @@ static void DumpThread() {
                 } catch (const std::exception& e) {
                     EspLog("[Bootstrap] dump failed: %s", e.what());
                     SetStatus(L"[-] Offset dump failed; retrying in 5s...");
-                    Sleep(5000);
+                    WaitWhileRunning(5000);
                 }
             }
             if (!g_Running.load(std::memory_order_acquire)) break;
@@ -996,7 +1246,7 @@ static void DumpThread() {
         if (!g_Client.IsInContext()) {
             EspLog("[Bootstrap] refusing overlay start without local shared transport");
             SetStatus(L"[-] Local kernel transport mapping failed; retrying in 5s...");
-            Sleep(5000);
+            WaitWhileRunning(5000);
             continue;
         }
 
@@ -1035,7 +1285,7 @@ static void DumpThread() {
         if (!g_Running.load(std::memory_order_acquire) &&
             g_Client.RequestDriverStop()) {
             EspLog("[Bootstrap] app closing while game alive; driver unload requested");
-            Sleep(500);
+            Sleep(750);
         }
         g_Client.Shutdown();
         g_UseKernelRead.store(false, std::memory_order_release);
@@ -1045,30 +1295,61 @@ static void DumpThread() {
     if (!g_Running.load(std::memory_order_acquire) &&
         g_Client.RequestDriverStop()) {
         EspLog("[Bootstrap] final driver unload requested");
-        Sleep(500);
+        Sleep(750);
     }
     EspLog("[Bootstrap] thread exit");
 }
 
 
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    std::lock_guard<std::recursive_mutex> settingsLock(g_SettingsMutex);
     switch (m) {
+    case WM_QUERYENDSESSION:
+        return TRUE;
+
+    case WM_ENDSESSION:
+        if (w) {
+            g_Running.store(false, std::memory_order_release);
+            DestroyWindow(h);
+        }
+        return 0;
+
+    case WM_CLOSE:
+        if (!g_Closing) {
+            g_Closing = true;
+            KillTimer(h, FADE_TIMER_ID);
+            KillTimer(h, STARTUP_SOUND_TIMER_ID);
+            g_ExitInitialAlpha = g_CurrentAlpha;
+            g_ExitStarted = GetTickCount();
+            PlayStartupSound(true);
+            SetTimer(h, EXIT_FADE_TIMER_ID, 16, nullptr);
+        }
+        return 0;
+
     case WM_DESTROY:
+        KillTimer(h, EXIT_FADE_TIMER_ID);
         UnregisterHotKey(h, MENU_HOTKEY_ID);
         g_Running.store(false, std::memory_order_release);
         PostQuitMessage(0);
         return 0;
 
     case WM_CREATE: {
-        g_BgBrush = CreateSolidBrush(RGB(17, 19, 24));
-        g_InputBrush = CreateSolidBrush(RGB(27, 31, 39));
+        g_BgBrush = CreateSolidBrush(Ui::Canvas);
+        g_InputBrush = CreateSolidBrush(Ui::Surface);
         g_FontCons = CreateFont(16, 0, 0, 0, FW_NORMAL, 0, 0, 0,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
         g_FontSegoe = CreateFont(26, 0, 0, 0, FW_BOLD, 0, 0, 0,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+        g_FontBody = CreateFontW(-16, 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI Variable Text");
+        g_FontSmall = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI Variable Text");
+        g_FontSection = CreateFontW(-18, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI Variable Display");
 
         RECT rc; GetClientRect(h, &rc);
         RegisterHotKey(h, MENU_HOTKEY_ID, MOD_NOREPEAT, VK_F3);
@@ -1081,6 +1362,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         g_hClose = CreateWindow(L"BtnC", 0, WS_CHILD | WS_VISIBLE, rc.right - 34, 5, 28, 24, h, (HMENU)0, 0, 0);
         g_hMin = CreateWindow(L"BtnM", 0, WS_CHILD | WS_VISIBLE, rc.right - 66, 5, 28, 24, h, 0, 0, 0);
+        ShowWindow(g_hClose, SW_HIDE);
+        ShowWindow(g_hMin, SW_HIDE);
 
         INITCOMMONCONTROLSEX icex = {sizeof(icex), ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES};
         InitCommonControlsEx(&icex);
@@ -1119,6 +1402,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetWindowTheme(g_hTabConfig, L"", L"");
         CreateConfigControls(g_hTabConfig);
         SyncControlsFromSettings();
+        Ui::StyleChildren(g_hTabAim);
+        Ui::StyleChildren(g_hTabEsp);
+        Ui::StyleChildren(g_hTabMisc);
+        Ui::StyleChildren(g_hTabConfig);
 
         ShowWindow(g_hTabAim, SW_SHOW);
         ShowWindow(g_hTabEsp, SW_HIDE);
@@ -1126,9 +1413,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         ShowWindow(g_hTabConfig, SW_HIDE);
 
         g_hStatus = CreateWindow(L"STATIC", L"[*] Loading...",
-            WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
+            WS_CHILD | SS_CENTERIMAGE,
             15, rc.bottom - 30, rc.right - 30, 22, h, 0, 0, 0);
         SendMessage(g_hStatus, WM_SETFONT, (WPARAM)g_FontCons, TRUE);
+        ShowWindow(g_hTab, SW_HIDE);
+        if (!lks::modern_ui::initialize(h)) return -1;
 
         g_DumpWorker = std::thread(DumpThread);
     } return 0;
@@ -1146,7 +1435,24 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         break;
 
+    case WM_SIZE:
+        lks::modern_ui::resize(LOWORD(l), HIWORD(l));
+        return 0;
+
+    case WM_MOUSEMOVE:
+        if (GetCapture() == h) {
+            std::lock_guard<std::recursive_mutex> lock(g_SettingsMutex);
+            lks::modern_ui::mouse_move(GET_X_LPARAM(l), GET_Y_LPARAM(l));
+        } else {
+            lks::modern_ui::mouse_move(GET_X_LPARAM(l), GET_Y_LPARAM(l));
+        }
+        return 0;
+    case WM_MOUSELEAVE:
+        lks::modern_ui::mouse_leave();
+        return 0;
+
     case WM_COMMAND: {
+        std::lock_guard<std::recursive_mutex> settingsLock(g_SettingsMutex);
         int id = LOWORD(w);
         if (id == 200) {
             COLORREF c = PickColor(g_hTabEsp, g_TempBoxCol);
@@ -1268,6 +1574,33 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     } return 0;
 
     case WM_TIMER:
+        if (w == EXIT_FADE_TIMER_ID) {
+            const float elapsed = static_cast<float>(GetTickCount() - g_ExitStarted);
+            const float t = std::clamp(elapsed / 520.0f, 0.0f, 1.0f);
+            const float eased = t * t * (3.0f - 2.0f * t);
+            g_CurrentAlpha = static_cast<BYTE>(std::round(
+                static_cast<float>(g_ExitInitialAlpha) * (1.0f - eased)));
+            SetLayeredWindowAttributes(h, 0, g_CurrentAlpha, LWA_ALPHA);
+            if (elapsed >= 760.0f) {
+                KillTimer(h, EXIT_FADE_TIMER_ID);
+                DestroyWindow(h);
+            }
+            return 0;
+        }
+        if (w == STARTUP_SOUND_TIMER_ID) {
+            KillTimer(h, STARTUP_SOUND_TIMER_ID);
+            PlayStartupSound();
+            return 0;
+        }
+        if (w == FADE_TIMER_ID) {
+            const float elapsed = static_cast<float>(GetTickCount() - g_FadeStarted);
+            const float t = std::clamp(elapsed / 460.0f, 0.0f, 1.0f);
+            const float eased = 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
+            g_CurrentAlpha = static_cast<BYTE>(std::round(eased * 255.0f));
+            SetLayeredWindowAttributes(h, 0, g_CurrentAlpha, LWA_ALPHA);
+            if (t >= 1.0f) KillTimer(h, FADE_TIMER_ID);
+            return 0;
+        }
         if (w == 0x4B) {
             if (!g_ListeningForKey) {
                 KillTimer(h, 0x4B);
@@ -1312,7 +1645,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             FinishKeyCapture(VK_LBUTTON);
             return 0;
         }
-        break;
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_SettingsMutex);
+            lks::modern_ui::mouse_down(GET_X_LPARAM(l), GET_Y_LPARAM(l));
+        }
+        return 0;
+
+    case WM_LBUTTONUP:
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_SettingsMutex);
+            lks::modern_ui::mouse_up(GET_X_LPARAM(l), GET_Y_LPARAM(l));
+        }
+        return 0;
 
     case WM_RBUTTONDOWN:
         if (g_ListeningForKey) {
@@ -1352,45 +1696,35 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLORBTN: {
         HDC dc = (HDC)w; SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(180, 180, 180));
+        SetTextColor(dc, Ui::Text);
         return (LRESULT)g_BgBrush;
     }
     case WM_CTLCOLORLISTBOX:
     case WM_CTLCOLOREDIT: {
-        HDC dc = (HDC)w; SetBkColor(dc, RGB(27, 31, 39));
-        SetTextColor(dc, RGB(200, 200, 200));
+        HDC dc = (HDC)w; SetBkColor(dc, Ui::Surface);
+        SetTextColor(dc, Ui::TextHi);
         return (LRESULT)g_InputBrush;
     }
 
     case WM_DRAWITEM: {
         DRAWITEMSTRUCT* di = (DRAWITEMSTRUCT*)l;
-        if (di->CtlType == ODT_BUTTON &&
-            (di->CtlID >= 200 && di->CtlID <= 204)) {
-            COLORREF c = di->CtlID == 200 ? g_TempBoxCol :
-                di->CtlID == 201 ? g_TempSkelCol :
-                di->CtlID == 202 ? g_TempFovCol :
-                di->CtlID == 203 ? g_TempSkelVisibleCol :
-                g_TempSkelHiddenCol;
-            HBRUSH br = CreateSolidBrush(c);
-            RECT r = di->rcItem;
-            InflateRect(&r, -2, -2);
-            FillRect(di->hDC, &r, br);
-            FrameRect(di->hDC, &r, (HBRUSH)GetStockObject(WHITE_BRUSH));
-            DeleteObject(br);
-            return TRUE;
-        }
+        if (Ui::DrawControl(di)) return TRUE;
         if (di->CtlType == ODT_TAB) {
             BOOL sel = di->itemState & ODS_SELECTED;
             RECT r = di->rcItem;
-            HBRUSH bg = CreateSolidBrush(sel ? RGB(35, 42, 54) : RGB(17, 19, 24));
-            FillRect(di->hDC, &r, bg);
-            DeleteObject(bg);
+            InflateRect(&r, -5, -5);
+            Ui::RoundFill(di->hDC, r, 12, sel ? Ui::SurfaceHover : Ui::Canvas);
+            if (sel) {
+                RECT marker{r.left + 18, r.bottom - 3, r.right - 18, r.bottom};
+                Ui::RoundFill(di->hDC, marker, 3, Ui::Accent);
+            }
             wchar_t text[64] = {};
             TCITEMW ti = {TCIF_TEXT};
             ti.pszText = text;
             ti.cchTextMax = 64;
             TabCtrl_GetItem(g_hTab, di->itemID, &ti);
-            SetTextColor(di->hDC, sel ? RGB(220, 220, 220) : RGB(140, 140, 140));
+            SelectObject(di->hDC, g_FontBody);
+            SetTextColor(di->hDC, sel ? Ui::TextHi : Ui::TextDim);
             SetBkMode(di->hDC, TRANSPARENT);
             DrawText(di->hDC, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             return TRUE;
@@ -1398,38 +1732,24 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     } return 0;
 
     case WM_PAINT: {
-        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
-        RECT rc; GetClientRect(h, &rc);
-        FillRect(dc, &rc, g_BgBrush);
-
-        HPEN line = CreatePen(PS_SOLID, 1, RGB(40, 40, 48));
-        HGDIOBJ oldPen = SelectObject(dc, line);
-        MoveToEx(dc, 0, 36, 0); LineTo(dc, rc.right, 36);
-        MoveToEx(dc, 0, rc.bottom - 38, 0); LineTo(dc, rc.right, rc.bottom - 38);
-        SelectObject(dc, oldPen);
-        DeleteObject(line);
-
-        HGDIOBJ oldFont = SelectObject(dc, g_FontSegoe);
-        SetTextColor(dc, RGB(74, 222, 180));
-        SetBkMode(dc, TRANSPARENT);
-        TextOut(dc, 15, 5, L"Lks667 Kernel RO CS2", 20);
-
-        HFONT fver = CreateFont(14, 0, 0, 0, FW_NORMAL, 0, 0, 0,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
-        SelectObject(dc, fver);
-        SetTextColor(dc, RGB(120, 120, 130));
-        TextOut(dc, 220, 10, L"CONTROL  |  F3", 14);
-        SelectObject(dc, oldFont);
-        DeleteObject(fver);
-
+        PAINTSTRUCT ps; BeginPaint(h, &ps);
+        std::unique_lock<std::recursive_mutex> lock(
+            g_SettingsMutex, std::try_to_lock);
+        if (lock.owns_lock()) lks::modern_ui::paint();
         EndPaint(h, &ps);
     } return 0;
 
+    case WM_SETCURSOR:
+        if (LOWORD(l) == HTCLIENT) {
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            return TRUE;
+        }
+        break;
+
     case WM_NCHITTEST: {
-        LRESULT r = DefWindowProc(h, m, w, l);
-        if (r == HTCLIENT) return HTCAPTION;
-        return r;
+        POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)}; ScreenToClient(h, &p);
+        if (p.y < 40 && !lks::modern_ui::hit_caption_button(p.x, p.y)) return HTCAPTION;
+        return HTCLIENT;
     }
 
     default: return DefWindowProc(h, m, w, l);
@@ -1440,10 +1760,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int show) {
     WNDCLASS wc = {};
     wc.lpfnWndProc = WndProc; wc.hInstance = hInst;
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.lpszClassName = L"LksMenu";
     RegisterClass(&wc);
 
-    int w = 780, h = 580;
+    int w = 1100, h = 720;
     g_hWnd = CreateWindowEx(
         WS_EX_LAYERED | WS_EX_TOPMOST,
         L"LksMenu",
@@ -1454,9 +1775,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int show) {
         w, h, 0, 0, hInst, 0);
     if (!g_hWnd) return 0;
 
-    SetWindowRgn(g_hWnd, CreateRoundRectRgn(0, 0, w, h, 12, 12), TRUE);
-    SetLayeredWindowAttributes(g_hWnd, 0, 255, LWA_ALPHA);
+    const DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
+    DwmSetWindowAttribute(g_hWnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+                          &corners, sizeof(corners));
+
+    SetLayeredWindowAttributes(g_hWnd, 0, 0, LWA_ALPHA);
     ShowWindow(g_hWnd, show);
+    UpdateWindow(g_hWnd);
+    g_FadeStarted = GetTickCount();
+    SetTimer(g_hWnd, FADE_TIMER_ID, 16, nullptr);
+    SetTimer(g_hWnd, STARTUP_SOUND_TIMER_ID, 1300, nullptr);
 
     MSG msg;
     while (GetMessage(&msg, 0, 0, 0)) {
@@ -1467,8 +1795,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int show) {
     StopOverlay();
     g_UseKernelRead.store(false, std::memory_order_release);
     g_Client.Shutdown();
+    lks::modern_ui::shutdown();
     if (g_FontCons) DeleteObject(g_FontCons);
     if (g_FontSegoe) DeleteObject(g_FontSegoe);
+    if (g_FontBody) DeleteObject(g_FontBody);
+    if (g_FontSmall) DeleteObject(g_FontSmall);
+    if (g_FontSection) DeleteObject(g_FontSection);
     if (g_InputBrush) DeleteObject(g_InputBrush);
     if (g_BgBrush) DeleteObject(g_BgBrush);
     return 0;

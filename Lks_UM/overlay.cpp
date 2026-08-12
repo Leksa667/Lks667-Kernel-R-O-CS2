@@ -1069,7 +1069,8 @@ static bool ReadWorldEntities(
     std::vector<WorldEnt>& output) {
     output.clear();
     if (!client ||
-        (!settings.showWeapons && !settings.showGrenades && !settings.showBomb))
+        (!settings.showWeapons && !settings.showGrenades && !settings.showBomb &&
+         !settings.showChickens))
         return true;
 
     const uintptr_t entityListOff =
@@ -1180,13 +1181,16 @@ static bool ReadWorldEntities(
             name == "weapon_hegrenade" || name == "weapon_flashbang" ||
             name == "weapon_smokegrenade" || name == "weapon_molotov" ||
             name == "weapon_incgrenade" || name == "weapon_decoy";
-        if (name == "weapon_c4") type = ENT_BOMB;
+        if (name == "chicken" || name.find("chicken") != std::string::npos)
+            type = ENT_CHICKEN;
+        else if (name == "weapon_c4") type = ENT_BOMB;
         else if (grenade) type = ENT_GRENADE;
         else if (name.rfind("weapon_", 0) == 0) type = ENT_WEAPON;
         if (type == ENT_UNKNOWN) continue;
         if (type == ENT_WEAPON && !settings.showWeapons) continue;
         if (type == ENT_GRENADE && !settings.showGrenades) continue;
         if (type == ENT_BOMB && !settings.showBomb) continue;
+        if (type == ENT_CHICKEN && !settings.showChickens) continue;
         candidates.push_back({index, type, std::move(name)});
     }
 
@@ -2045,6 +2049,8 @@ static void OverlayLoop(HANDLE hProc) {
                     continue;
                 if (world.type == ENT_BOMB && !espSettings.showBomb)
                     continue;
+                if (world.type == ENT_CHICKEN && !espSettings.showChickens)
+                    continue;
                 const Vec2 point = W2S(world.origin, vm, sw, sh);
                 if (point.x < 0.f || point.y < 0.f ||
                     point.x >= sw || point.y >= sh) continue;
@@ -2053,6 +2059,8 @@ static void OverlayLoop(HANDLE hProc) {
                     color = espSettings.grenadeColor;
                 else if (world.type == ENT_BOMB)
                     color = espSettings.bombColor;
+                else if (world.type == ENT_CHICKEN)
+                    color = RGB(255, 210, 60);
                 DrawWorldLabel(hdcMem, point, color, world.name);
             }
             if (espSettings.showBomb && snapshot->bomb.valid &&

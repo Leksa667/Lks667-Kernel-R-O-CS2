@@ -61,6 +61,10 @@ bool MapKernelDriver(const std::wstring& sysPath, std::wstring& error) {
         return false;
     }
 
+    struct VulnerableDriverGuard {
+        ~VulnerableDriverGuard() { intel_driver::Unload(); }
+    } vulnerableDriverGuard;
+
     NTSTATUS exitCode = 0;
     const ULONG64 mapped = kdmapper::MapDriver(
         rawImage.data(),
@@ -72,8 +76,6 @@ bool MapKernelDriver(const std::wstring& sysPath, std::wstring& error) {
         false,
         MapBaseCallback,
         &exitCode);
-
-    intel_driver::Unload();
 
     if (!mapped || !NT_SUCCESS(exitCode)) {
         error = L"driver entry failed (0x" +

@@ -1828,6 +1828,14 @@ VOID PollingThread(PVOID Context)
                 InterlockedExchange(&g_Running, FALSE);
                 break;
             }
+            if (g_ControllerProcess &&
+                PsGetProcessExitStatus(g_ControllerProcess) != STATUS_PENDING)
+            {
+                DbgPrint(
+                    "[LksDriver] controller exited; stopping resources\n");
+                InterlockedExchange(&g_Running, FALSE);
+                break;
+            }
             nextProcessLivenessCheck =
                 interruptTime + 10ULL * 1000ULL * 1000ULL;
         }
