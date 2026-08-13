@@ -217,7 +217,7 @@ struct AimSettings {
     bool enabled = false;
     int aimKey = 0x06;
     int aimBone = 7;
-    int aimMode = AIM_SMOOTH_EASE_OUT;
+    int aimMode = AIM_SMOOTH_COMBO;
     float aimFov = 8.f;
     float aimSmooth = 5.f;
     bool visibleOnly = false;

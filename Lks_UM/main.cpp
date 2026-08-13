@@ -384,7 +384,32 @@ static std::filesystem::path ConfigFolder();
 static void RefreshConfigList();
 
 static void EspLog(const char* fmt, ...) {
-    UNREFERENCED_PARAMETER(fmt);
+    char buf[2048];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    static std::recursive_mutex logMtx;
+    std::lock_guard<std::recursive_mutex> logLock(logMtx);
+    static std::filesystem::path logPath;
+    static bool pathReady = false;
+    if (!pathReady) {
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring p(exe);
+        const size_t slash = p.find_last_of(L'\\');
+        logPath = (slash == std::wstring::npos) ?
+            std::filesystem::path(L"esp.log") :
+            std::filesystem::path(p.substr(0, slash + 1)) / L"esp.log";
+        pathReady = true;
+    }
+    FILE* f = _wfopen(logPath.c_str(), L"a");
+    if (!f) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "[%02u:%02u:%02u.%03u] %s\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buf);
+    fclose(f);
 }
 static void CreateEspControls(HWND parent) {
     auto mkchk = [&](const wchar_t* t, int id, int x, int y) {
@@ -773,7 +798,6 @@ static void SaveConfig() {
     f << "aimBone=" << g_AimSettings.aimBone << "\n";
     f << "aimFov=" << g_AimSettings.aimFov << "\n";
     f << "aimSmooth=" << g_AimSettings.aimSmooth << "\n";
-    f << "aimMode=" << g_AimSettings.aimMode << "\n";
     f << "teamCheck=" << g_AimSettings.teamCheck << "\n";
     f << "visibleOnly=" << g_AimSettings.visibleOnly << "\n";
     f << "humanize=" << g_AimSettings.humanize << "\n";
@@ -844,9 +868,6 @@ static void LoadConfig() {
             else if (key == "aimBone") g_AimSettings.aimBone = std::stoi(val);
             else if (key == "aimFov") g_AimSettings.aimFov = std::stof(val);
             else if (key == "aimSmooth") g_AimSettings.aimSmooth = std::stof(val);
-            else if (key == "aimMode")
-                g_AimSettings.aimMode =
-                    std::clamp(std::stoi(val), (int)AIM_SMOOTH_EASE_OUT, (int)AIM_SMOOTH_COMBO);
             else if (key == "teamCheck") g_AimSettings.teamCheck = (val == "1");
             else if (key == "visibleOnly") g_AimSettings.visibleOnly = (val == "1");
             else if (key == "humanize") g_AimSettings.humanize = (val == "1");
@@ -1664,6 +1685,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         {
             std::lock_guard<std::recursive_mutex> lock(g_SettingsMutex);
+            EspLog("[UI] down x=%d y=%d", GET_X_LPARAM(l), GET_Y_LPARAM(l));
             lks::modern_ui::mouse_down(GET_X_LPARAM(l), GET_Y_LPARAM(l));
         }
         return 0;
@@ -1671,6 +1693,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_LBUTTONUP:
         {
             std::lock_guard<std::recursive_mutex> lock(g_SettingsMutex);
+            EspLog("[UI] up x=%d y=%d", GET_X_LPARAM(l), GET_Y_LPARAM(l));
             lks::modern_ui::mouse_up(GET_X_LPARAM(l), GET_Y_LPARAM(l));
         }
         return 0;
@@ -1750,9 +1773,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
     case WM_PAINT: {
         PAINTSTRUCT ps; BeginPaint(h, &ps);
-        std::unique_lock<std::recursive_mutex> lock(
-            g_SettingsMutex, std::try_to_lock);
-        if (lock.owns_lock()) lks::modern_ui::paint();
+        std::lock_guard<std::recursive_mutex> lock(g_SettingsMutex);
+        lks::modern_ui::paint();
         EndPaint(h, &ps);
     } return 0;
 

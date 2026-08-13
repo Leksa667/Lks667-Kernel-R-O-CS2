@@ -24,6 +24,7 @@ struct HudData {
     float readMs = 0.f;
     float snapshotHz = 0.f;
     float presentMs = 0.f;
+    int localTeam = 0;
     BombInfo bomb;
 };
 
@@ -63,7 +64,7 @@ void ApplyVisibility() {
     if (wantVisible) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
-void DrawBomb(const BombInfo& bomb) {
+void DrawBomb(const BombInfo& bomb, int localTeam) {
     const float x = (float)kPad;
     const float textW = (float)(kWidth - 2 * kPad);
     g_renderer.text(L"BOMBE", D2D1::RectF(x, 20, x + 90, 36), FontCaption, accent);
@@ -79,9 +80,19 @@ void DrawBomb(const BombInfo& bomb) {
             FontBodyStrong, text_dim);
         return;
     }
-    if (bomb.carried || bomb.dropped) {
-        g_renderer.text(bomb.carried ? L"PORTEE PAR CT" : L"AU SOL",
-            D2D1::RectF(x, 42, textW, 74), FontDisplay, accent);
+    if (bomb.carried) {
+        if (bomb.carrierTeam != 0 && bomb.carrierTeam != localTeam) {
+            g_renderer.text(bomb.carrierTeam == 2 ? L"PORTEE PAR CT" : L"PORTEE PAR T",
+                D2D1::RectF(x, 42, textW, 74), FontDisplay, accent);
+        } else {
+            g_renderer.text(L"EN ATTENTE", D2D1::RectF(x, 42, textW, 72),
+                FontBodyStrong, text_dim);
+        }
+        return;
+    }
+    if (bomb.dropped) {
+        g_renderer.text(L"AU SOL", D2D1::RectF(x, 42, textW, 74),
+            FontDisplay, accent);
         return;
     }
 
@@ -159,7 +170,7 @@ void Paint() {
     }
     g_renderer.begin();
     const bool both = d.showBomb && d.showInfo;
-    if (d.showBomb) DrawBomb(d.bomb);
+    if (d.showBomb) DrawBomb(d.bomb, d.localTeam);
     if (both)
         g_renderer.fill(D2D1::RectF(kPad, 116, (float)(kWidth - kPad), 117),
             stroke);
@@ -223,7 +234,7 @@ bool HudCreate(HINSTANCE hInst, const std::wstring& configFolder) {
     const DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
     DwmSetWindowAttribute(g_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
         &corners, sizeof(corners));
-    SetLayeredWindowAttributes(g_hwnd, 0, 235, LWA_ALPHA);
+    SetLayeredWindowAttributes(g_hwnd, 0, 130, LWA_ALPHA);
     ShowWindow(g_hwnd, SW_HIDE);
     return true;
 }
@@ -235,7 +246,8 @@ void HudDestroy() {
 }
 
 void HudUpdate(bool showInfo, bool showBomb, float fps, int players,
-    float readMs, float snapshotHz, float presentMs, const BombInfo& bomb) {
+    float readMs, float snapshotHz, float presentMs, const BombInfo& bomb,
+    int localTeam) {
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_data.showInfo = showInfo;
@@ -245,6 +257,7 @@ void HudUpdate(bool showInfo, bool showBomb, float fps, int players,
         g_data.readMs = readMs;
         g_data.snapshotHz = snapshotHz;
         g_data.presentMs = presentMs;
+        g_data.localTeam = localTeam;
         g_data.bomb = bomb;
     }
     ApplyVisibility();

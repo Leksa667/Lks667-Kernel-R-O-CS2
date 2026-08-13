@@ -19,6 +19,7 @@
 #include <memory>
 #include <random>
 #include <cctype>
+#include <filesystem>
 #pragma comment(lib, "dwmapi.lib")
 
 extern LksClient g_Client;
@@ -38,7 +39,32 @@ static void OvStatus(const wchar_t* s) {
 }
 
 void EspLog(const char* fmt, ...) {
-    UNREFERENCED_PARAMETER(fmt);
+    char buf[2048];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    static std::recursive_mutex logMtx;
+    std::lock_guard<std::recursive_mutex> logLock(logMtx);
+    static std::filesystem::path logPath;
+    static bool pathReady = false;
+    if (!pathReady) {
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring p(exe);
+        const size_t slash = p.find_last_of(L'\\');
+        logPath = (slash == std::wstring::npos) ?
+            std::filesystem::path(L"esp.log") :
+            std::filesystem::path(p.substr(0, slash + 1)) / L"esp.log";
+        pathReady = true;
+    }
+    FILE* f = _wfopen(logPath.c_str(), L"a");
+    if (!f) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "[%02u:%02u:%02u.%03u] %s\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buf);
+    fclose(f);
 }
 
 static void InitNtRead() {
@@ -1077,12 +1103,13 @@ static std::string FriendlyWorldName(std::string name) {
 static bool ReadWorldEntities(
     uintptr_t client,
     const EspSettings& settings,
+    bool scanBomb,
     const std::vector<PlayerEnt>& players,
     std::vector<WorldEnt>& output) {
     output.clear();
     if (!client ||
-        (!settings.showWeapons && !settings.showGrenades && !settings.showBomb &&
-         !settings.showChickens))
+        (!settings.showWeapons && !settings.showGrenades &&
+         !settings.showBomb && !settings.showChickens && !scanBomb))
         return true;
 
     const uintptr_t entityListOff =
@@ -1105,23 +1132,36 @@ static bool ReadWorldEntities(
         "client.dll", "C_BaseEntity", "m_hOwnerEntity");
     const uintptr_t ownerPawnOff = FindFieldOff(
         "client.dll", "C_BasePlayerWeapon", "m_hOwnerPawn");
-    if (!entityListOff || !gameSystemOff || !highestOff || !identityOff ||
-        !designerNameOff || !sceneNodeOff || !originOff || !ownerOff)
+    if (!entityListOff || !identityOff ||
+        !designerNameOff || !sceneNodeOff || !originOff || !ownerOff) {
+        EspLog("[World] MISSING offsets eList=0x%llX id=0x%llX dn=0x%llX sn=0x%llX or=0x%llX ow=0x%llX",
+            entityListOff, identityOff, designerNameOff,
+            sceneNodeOff, originOff, ownerOff);
         return false;
+    }
 
     uintptr_t entityList = 0;
     uintptr_t gameSystem = 0;
-    if (ExecuteExactReads({
-            {client + entityListOff, &entityList, sizeof(entityList)},
-            {client + gameSystemOff, &gameSystem, sizeof(gameSystem)}}) != 2 ||
-        !entityList || !gameSystem)
-        return false;
+    {
+        std::vector<ExactReadJob> jobs;
+        jobs.reserve(2);
+        jobs.push_back(
+            {client + entityListOff, &entityList, sizeof(entityList)});
+        if (gameSystemOff)
+            jobs.push_back(
+                {client + gameSystemOff, &gameSystem, sizeof(gameSystem)});
+        if (ExecuteExactReads(jobs) == 0 || !entityList)
+            return false;
+    }
 
-    int highest = 0;
-    if (ExecuteExactReads({{
-            gameSystem + highestOff, &highest, sizeof(highest)}}) != 1)
-        return false;
-    highest = std::clamp(highest, 64, 2048);
+    int highest = 2048;
+    if (gameSystem && highestOff) {
+        int hs = 0;
+        if (ExecuteExactReads({{
+                gameSystem + highestOff, &hs, sizeof(hs)}}) != 1)
+            return false;
+        highest = std::clamp(hs, 64, 2048);
+    }
 
     const int bucketCount = (highest >> 9) + 1;
     std::vector<uintptr_t> buckets(bucketCount);
@@ -1201,7 +1241,7 @@ static bool ReadWorldEntities(
         if (type == ENT_UNKNOWN) continue;
         if (type == ENT_WEAPON && !settings.showWeapons) continue;
         if (type == ENT_GRENADE && !settings.showGrenades) continue;
-        if (type == ENT_BOMB && !settings.showBomb) continue;
+        if (type == ENT_BOMB && !settings.showBomb && !scanBomb) continue;
         if (type == ENT_CHICKEN && !settings.showChickens) continue;
         candidates.push_back({index, type, std::move(name)});
     }
@@ -1245,8 +1285,6 @@ static bool ReadWorldEntities(
         const uint32_t ownerIndex = hasPawnOwner
             ? (candidate.ownerPawn & 0x7FFFu)
             : (candidate.owner & 0x7FFFu);
-        
-        
         const bool attachedToSceneParent = candidate.sceneParent != 0;
         if (candidate.type != ENT_BOMB && !projectile &&
             (hasOwner || attachedToSceneParent))
@@ -1256,7 +1294,13 @@ static bool ReadWorldEntities(
         world.owner = hasOwner ? entities[ownerIndex] : 0;
         world.type = candidate.type;
         world.name = FriendlyWorldName(candidate.name);
-        if (world.owner && candidate.type == ENT_BOMB) {
+        if (candidate.type == ENT_BOMB) {
+            world.origin = candidate.sceneNode ? candidate.origin : Vec3{};
+            if (!std::isfinite(world.origin.x) ||
+                !std::isfinite(world.origin.y) ||
+                !std::isfinite(world.origin.z)) continue;
+            if (!hasOwner)
+                world.owner = 0;
             output.push_back(std::move(world));
             continue;
         }
@@ -1265,7 +1309,7 @@ static bool ReadWorldEntities(
         if (!std::isfinite(world.origin.x) ||
             !std::isfinite(world.origin.y) ||
             !std::isfinite(world.origin.z)) continue;
-        if (candidate.type != ENT_BOMB) {
+        {
             bool overlapsInventory = false;
             for (const auto& player : players) {
                 const float dx = world.origin.x - player.origin.x;
@@ -1279,6 +1323,14 @@ static bool ReadWorldEntities(
             if (overlapsInventory) continue;
         }
         output.push_back(std::move(world));
+    }
+    static int worldScanCounter = 0;
+    if ((worldScanCounter++ & 255) == 0) {
+        size_t bombs = 0;
+        for (const auto& w : output)
+            if (w.type == ENT_BOMB) bombs++;
+        EspLog("[World] scan ent=%d cand=%zu out=%zu bomb=%zu",
+            highest, candidates.size(), output.size(), bombs);
     }
     return g_Client.IsTransportHealthy();
 }
@@ -1589,6 +1641,11 @@ static void DoSoftAim(HANDLE hProc, uintptr_t client, const std::vector<PlayerEn
     int moveX = 0, moveY = 0;
     const float dtSec = std::clamp(aimDt * 0.016666f, 0.001f, 0.1f);
     const float euroDCutoff = 1.f;
+    static int g_LastAimMode = -1;
+    if (g_LastAimMode != aimSettings.aimMode) {
+        g_LastAimMode = aimSettings.aimMode;
+        resetMotion();
+    }
     const auto oneEuroFilter = [&](float inX, float inY, float minCutoff,
         float beta, float& outX, float& outY) {
         if (!g_EuroInit) {
@@ -1622,12 +1679,14 @@ static void DoSoftAim(HANDLE hProc, uintptr_t client, const std::vector<PlayerEn
             2.f * 3.14159265f * (2.4f / smoothFactor);
         const float k = omega * omega;
         const float c = 2.f * omega * 0.95f;
-        const float springTargetX = jitterize(pixelDx) * nearScale;
-        const float springTargetY = jitterize(pixelDy) * nearScale;
-        g_SpringVelX +=
-            (k * (springTargetX - g_SpringPosX) - c * g_SpringVelX) * aimDt;
-        g_SpringVelY +=
-            (k * (springTargetY - g_SpringPosY) - c * g_SpringVelY) * aimDt;
+        const float springTargetX =
+            jitterize(pixelDx) * nearScale / smoothFactor;
+        const float springTargetY =
+            jitterize(pixelDy) * nearScale / smoothFactor;
+        g_SpringVelX = (g_SpringVelX +
+            k * (springTargetX - g_SpringPosX) * aimDt) / (1.f + c * aimDt);
+        g_SpringVelY = (g_SpringVelY +
+            k * (springTargetY - g_SpringPosY) * aimDt) / (1.f + c * aimDt);
         g_SpringPosX += g_SpringVelX * aimDt;
         g_SpringPosY += g_SpringVelY * aimDt;
         moveX = static_cast<int>(roundf(g_SpringPosX));
@@ -1636,36 +1695,34 @@ static void DoSoftAim(HANDLE hProc, uintptr_t client, const std::vector<PlayerEn
         g_SpringPosY -= static_cast<float>(moveY);
     } else if (aimSettings.aimMode == AIM_SMOOTH_ONE_EURO) {
         float filteredX = 0.f, filteredY = 0.f;
-        oneEuroFilter(jitterize(bestScreen.x), jitterize(bestScreen.y),
+        oneEuroFilter(bestScreen.x, bestScreen.y,
             2.f / smoothFactor, 0.7f, filteredX, filteredY);
-        g_ResidualX += filteredX - centerX;
-        g_ResidualY += filteredY - centerY;
+        g_ResidualX += (filteredX - centerX) + jitterize(0.f);
+        g_ResidualY += (filteredY - centerY) + jitterize(0.f);
         moveX = static_cast<int>(roundf(g_ResidualX));
         moveY = static_cast<int>(roundf(g_ResidualY));
     } else if (aimSettings.aimMode == AIM_SMOOTH_COMBO) {
         float filteredX = 0.f, filteredY = 0.f;
-        oneEuroFilter(jitterize(bestScreen.x), jitterize(bestScreen.y),
+        oneEuroFilter(bestScreen.x, bestScreen.y,
             1.5f / smoothFactor, 0.6f, filteredX, filteredY);
         const float omega =
             2.f * 3.14159265f * (2.0f / smoothFactor);
         const float k = omega * omega;
         const float c = 2.f * omega * 0.9f;
-        const float comboErrX = (filteredX - centerX) * nearScale;
-        const float comboErrY = (filteredY - centerY) * nearScale;
-        g_SpringVelX +=
-            (k * (comboErrX - g_SpringPosX) - c * g_SpringVelX) * aimDt;
-        g_SpringVelY +=
-            (k * (comboErrY - g_SpringPosY) - c * g_SpringVelY) * aimDt;
+        const float comboErrX =
+            (filteredX - centerX) * nearScale / smoothFactor + jitterize(0.f);
+        const float comboErrY =
+            (filteredY - centerY) * nearScale / smoothFactor + jitterize(0.f);
+        g_SpringVelX = (g_SpringVelX +
+            k * (comboErrX - g_SpringPosX) * aimDt) / (1.f + c * aimDt);
+        g_SpringVelY = (g_SpringVelY +
+            k * (comboErrY - g_SpringPosY) * aimDt) / (1.f + c * aimDt);
         g_SpringPosX += g_SpringVelX * aimDt;
         g_SpringPosY += g_SpringVelY * aimDt;
-        const float ease = std::clamp(aimSettings.ease, 0.01f, 0.95f);
-        const float easeStep = 1.f - powf(1.f - ease, aimDt);
-        g_SmoothVelX += (g_SpringVelX - g_SmoothVelX) * easeStep;
-        g_SmoothVelY += (g_SpringVelY - g_SmoothVelY) * easeStep;
-        g_ResidualX += g_SmoothVelX;
-        g_ResidualY += g_SmoothVelY;
-        moveX = static_cast<int>(roundf(g_ResidualX));
-        moveY = static_cast<int>(roundf(g_ResidualY));
+        moveX = static_cast<int>(roundf(g_SpringPosX));
+        moveY = static_cast<int>(roundf(g_SpringPosY));
+        g_SpringPosX -= static_cast<float>(moveX);
+        g_SpringPosY -= static_cast<float>(moveY);
     } else {
         float rawDx = jitterize(pixelDx) / smoothFactor * aimDt * nearScale;
         float rawDy = jitterize(pixelDy) / smoothFactor * aimDt * nearScale;
@@ -1927,6 +1984,7 @@ static void OverlayLoop(HANDLE hProc) {
                     ReadWorldEntities(
                         clientBase,
                         espSettings,
+                        espSettings.showBomb || miscSettings.showBombTimer,
                         next->players,
                         latestWorldEntities);
                     nextWorldScan = readFinished +
@@ -1999,7 +2057,9 @@ static void OverlayLoop(HANDLE hProc) {
             wasEnabled = espOn;
         }
 
-        if (!espOn)
+        const bool overlayActive = espOn || miscSettings.showCrosshair ||
+            miscSettings.showBombTimer || espSettings.showBomb;
+        if (!overlayActive)
         {
             if (IsWindowVisible(ov))
             {
@@ -2030,7 +2090,8 @@ static void OverlayLoop(HANDLE hProc) {
         const int localTeam = snapshot ? snapshot->localTeam : 0;
 
         uintptr_t bombCarrier = 0;
-        if (snapshot && espSettings.showBomb) {
+        if (snapshot &&
+            (espSettings.showBomb || miscSettings.showBombTimer)) {
             for (const auto& world : snapshot->worldEntities) {
                 if (world.type == ENT_BOMB && world.owner) {
                     bombCarrier = world.owner;
@@ -2040,13 +2101,15 @@ static void OverlayLoop(HANDLE hProc) {
             if (bombCarrier) {
                 for (const auto& carrier : players) {
                     if (!carrier.alive || carrier.pawn != bombCarrier) continue;
-                    Vec3 tagPosition = carrier.origin;
-                    tagPosition.z += 82.f;
-                    const Vec2 tag = W2S(tagPosition, vm, sw, sh);
-                    if (tag.x >= 0.f && tag.y >= 0.f &&
-                        tag.x < sw && tag.y < sh)
-                        DrawWorldLabel(
-                            hdcMem, tag, espSettings.bombColor, "C4 CARRIER");
+                    if (localTeam == 0 || localTeam != carrier.team) {
+                        Vec3 tagPosition = carrier.origin;
+                        tagPosition.z += 82.f;
+                        const Vec2 tag = W2S(tagPosition, vm, sw, sh);
+                        if (tag.x >= 0.f && tag.y >= 0.f &&
+                            tag.x < sw && tag.y < sh)
+                            DrawWorldLabel(
+                                hdcMem, tag, espSettings.bombColor, "C4 CARRIER");
+                    }
                     break;
                 }
             }
@@ -2055,6 +2118,7 @@ static void OverlayLoop(HANDLE hProc) {
         int rendered = 0;
         for (auto& p : players)
         {
+            if (!espOn) break;
             if (!p.alive) continue;
             if (localTeam && p.team == localTeam) continue;
             if (espSettings.visibleOnly && !p.visible) continue;
@@ -2142,12 +2206,42 @@ static void OverlayLoop(HANDLE hProc) {
 
         if (snapshot) {
             for (const auto& world : snapshot->worldEntities) {
-                if (world.owner) continue;
+                if (world.type == ENT_BOMB) {
+                    if (!(espSettings.showBomb || miscSettings.showBombTimer))
+                        continue;
+                    if (snapshot->bomb.planted) continue;
+                    bool carrierFound = false;
+                    bool carrierAlive = false;
+                    for (const auto& p : players) {
+                        if (p.pawn != world.owner) continue;
+                        carrierFound = true;
+                        carrierAlive = p.alive;
+                        break;
+                    }
+                    if (carrierFound && carrierAlive) continue;
+                    if (!carrierFound && world.owner) continue;
+                    if (world.origin.x == 0.f && world.origin.y == 0.f &&
+                        world.origin.z == 0.f) continue;
+                    const Vec2 point = W2S(world.origin, vm, sw, sh);
+                    if (point.x < 0.f || point.y < 0.f ||
+                        point.x >= sw || point.y >= sh) continue;
+                    DrawWorldLabel(
+                        hdcMem, point, espSettings.bombColor, world.name);
+                    continue;
+                }
+                if (world.owner) {
+                    bool carrierAlive = false;
+                    for (const auto& p : players) {
+                        if (p.pawn == world.owner && p.alive) {
+                            carrierAlive = true;
+                            break;
+                        }
+                    }
+                    if (carrierAlive && localTeam == 3) continue;
+                }
                 if (world.type == ENT_WEAPON && !espSettings.showWeapons)
                     continue;
                 if (world.type == ENT_GRENADE && !espSettings.showGrenades)
-                    continue;
-                if (world.type == ENT_BOMB && !espSettings.showBomb)
                     continue;
                 if (world.type == ENT_CHICKEN && !espSettings.showChickens)
                     continue;
@@ -2157,19 +2251,26 @@ static void OverlayLoop(HANDLE hProc) {
                 COLORREF color = espSettings.weaponColor;
                 if (world.type == ENT_GRENADE)
                     color = espSettings.grenadeColor;
-                else if (world.type == ENT_BOMB)
-                    color = espSettings.bombColor;
                 else if (world.type == ENT_CHICKEN)
                     color = RGB(255, 210, 60);
                 DrawWorldLabel(hdcMem, point, color, world.name);
             }
-            if (espSettings.showBomb && snapshot->bomb.valid &&
+            if ((espSettings.showBomb || miscSettings.showBombTimer) &&
+                snapshot->bomb.planted && snapshot->bomb.valid &&
                 !snapshot->bomb.defused) {
                 const Vec2 point = W2S(snapshot->bomb.origin, vm, sw, sh);
                 if (point.x >= 0.f && point.y >= 0.f &&
-                    point.x < sw && point.y < sh)
+                    point.x < sw && point.y < sh) {
+                    const float sinceSample = snapshot->bomb.sampledAtMs ?
+                        static_cast<float>(GetTickCount64() -
+                            snapshot->bomb.sampledAtMs) / 1000.f : 0.f;
+                    const float remaining = std::max(
+                        0.f, snapshot->bomb.timer - sinceSample);
+                    char label[48];
+                    snprintf(label, sizeof(label), "C4 %.1fs", remaining);
                     DrawWorldLabel(
-                        hdcMem, point, espSettings.bombColor, "Planted C4");
+                        hdcMem, point, espSettings.bombColor, label);
+                }
             }
         }
 
@@ -2212,7 +2313,8 @@ static void OverlayLoop(HANDLE hProc) {
                 displayedReadMs,
                 displayedSnapshotHz,
                 displayedPresentMs,
-                snapshot ? snapshot->bomb : emptyBomb);
+                snapshot ? snapshot->bomb : emptyBomb,
+                localTeam);
         }
 
         if (miscSettings.showDamageLog)
@@ -2308,6 +2410,8 @@ static void ReadBombInfo(HANDLE hProc, uintptr_t client,
     static bool wasBeingDefused = false;
     static float trackedDefuseLength = 0.f;
     static std::chrono::steady_clock::time_point defuseStartedAt = {};
+    static float defuseStartedGameTime = 0.f;
+    static uintptr_t trackedWorldBomb = 0;
     const auto now = std::chrono::steady_clock::now();
     if (now < nextProbe) return;
     nextProbe = now + std::chrono::milliseconds(500);
@@ -2335,23 +2439,62 @@ static void ReadBombInfo(HANDLE hProc, uintptr_t client,
     memcpy(&planted, plantedResult[0].data(), sizeof(planted));
     if (!planted) {
         BombInfo worldState = {};
+        const uintptr_t ownerPawnOff =
+            FindFieldOff("client.dll", "C_BaseEntity", "m_hOwnerEntity");
+        const uintptr_t entityListOff =
+            FindStaticOff("client.dll", "dwEntityList");
         for (const auto& world : worldEntities) {
             if (world.type != ENT_BOMB) continue;
-            if (world.owner) {
-                worldState.carried = true;
+            if (world.ptr && world.ptr != trackedWorldBomb)
+                trackedWorldBomb = world.ptr;
+            break;
+        }
+        if (trackedWorldBomb && ownerPawnOff && entityListOff) {
+            uint32_t handle = 0xFFFFFFFFu;
+            if (ExecuteExactReads({{
+                    trackedWorldBomb + ownerPawnOff,
+                    &handle, sizeof(handle)}}) == 1 &&
+                handle != 0 && handle != 0xFFFFFFFFu) {
+                const uint32_t index = handle & 0x7FFFu;
+                uintptr_t entityList = 0;
+                uintptr_t ownerPawn = 0;
+                if (ExecuteExactReads({{
+                        client + entityListOff,
+                        &entityList, sizeof(entityList)}}) == 1 && entityList) {
+                    uintptr_t bucket = 0;
+                    if (ExecuteExactReads({{
+                            entityList + 0x10 + sizeof(uintptr_t) * (index >> 9),
+                            &bucket, sizeof(bucket)}}) == 1 && bucket)
+                        ExecuteExactReads({{
+                            bucket + 0x70ULL * (index & 0x1FF),
+                            &ownerPawn, sizeof(ownerPawn)}});
+                }
+                bool carrierFound = false;
                 for (const auto& player : players) {
-                    if (player.pawn == world.owner) {
-                        worldState.carrierTeam = player.team;
-                        break;
+                    if (player.pawn != ownerPawn) continue;
+                    carrierFound = true;
+                    worldState.carrierTeam = player.team;
+                    if (player.alive)
+                        worldState.carried = true;
+                    break;
+                }
+                if (!carrierFound) {
+                    worldState.carried = true;
+                    const uintptr_t teamOff =
+                        FindFieldOff("client.dll", "C_BaseEntity", "m_iTeamNum");
+                    if (teamOff && ownerPawn) {
+                        int team = 0;
+                        if (ExecuteExactReads({{
+                                ownerPawn + teamOff,
+                                &team, sizeof(team)}}) == 1 &&
+                            (team == 2 || team == 3))
+                            worldState.carrierTeam = team;
                     }
                 }
-                break;
             }
-            worldState.dropped = true;
         }
-        if (worldState.dropped ||
-            (worldState.carried && worldState.carrierTeam == 3))
-        {
+        worldState.dropped = !worldState.carried;
+        if (worldState.dropped || worldState.carried) {
             worldState.sampledAtMs = GetTickCount64();
             worldState.valid = true;
         }
@@ -2362,8 +2505,14 @@ static void ReadBombInfo(HANDLE hProc, uintptr_t client,
         wasBeingDefused = false;
         trackedDefuseLength = 0.f;
         defuseStartedAt = {};
+        defuseStartedGameTime = 0.f;
+        EspLog("[Bomb] not planted: world=%zu carried=%d dropped=%d carrierTeam=%d valid=%d",
+            worldEntities.size(), (int)worldState.carried,
+            (int)worldState.dropped, worldState.carrierTeam,
+            (int)worldState.valid);
         return;
     }
+    trackedWorldBomb = 0;
 
     uintptr_t timerOff = FindFieldOff(
         "client.dll", "C_PlantedC4", "m_flC4Blow");
@@ -2421,20 +2570,47 @@ static void ReadBombInfo(HANDLE hProc, uintptr_t client,
         jobs.push_back({planted + siteOff, &next.site, sizeof(next.site)});
     if (sceneNodeOff)
         jobs.push_back({planted + sceneNodeOff, &sceneNode, sizeof(sceneNode)});
+    float curTime = 0.f;
+    const uintptr_t globalVarsOff =
+        FindStaticOff("client.dll", "dwGlobalVars");
+    if (globalVarsOff) {
+        uintptr_t globalVars = 0;
+        if (ExecuteExactReads({{
+                client + globalVarsOff, &globalVars, sizeof(globalVars)}}) == 1 &&
+            globalVars)
+            ExecuteExactReads({{
+                globalVars + 0x10, &curTime, sizeof(curTime)}});
+    }
     ExecuteExactReads(jobs);
+    static float lastGameTime = 0.f;
+    static bool gameClockMoving = false;
+    const bool timeIsFinite = curTime > 0.f && std::isfinite(curTime);
+    if (timeIsFinite) {
+        if (lastGameTime > 0.f) {
+            const float dt = curTime - lastGameTime;
+            if (dt >= 0.05f && dt <= 5.f)
+                gameClockMoving = true;
+            else if (dt < -0.05f)
+                gameClockMoving = false;
+        }
+        lastGameTime = curTime;
+    } else {
+        gameClockMoving = false;
+    }
+    const bool hasGameTime = timeIsFinite && gameClockMoving;
 
-    
-    
-    
     if (trackedBomb != planted || trackedAt.time_since_epoch().count() == 0) {
         trackedBomb = planted;
         trackedTimerLength =
             timerLength > 1.f && timerLength < 120.f ? timerLength : 40.f;
         trackedAt = now;
     }
-    const float elapsed = std::chrono::duration<float>(now - trackedAt).count();
-    next.timer = trackedTimerLength - elapsed;
-    if (next.timer < 0.f) next.timer = 0.f;
+    if (hasGameTime && blowTime > 0.f) {
+        next.timer = std::max(0.f, blowTime - curTime);
+    } else {
+        const float elapsed = std::chrono::duration<float>(now - trackedAt).count();
+        next.timer = std::max(0.f, trackedTimerLength - elapsed);
+    }
     next.timerLength = trackedTimerLength;
     next.defuserEnt = static_cast<int>(defuserHandle & 0x7FFFu);
     if (next.beingDefused) {
@@ -2442,17 +2618,27 @@ static void ReadBombInfo(HANDLE hProc, uintptr_t client,
             trackedDefuseLength =
                 defuseLength > 1.f && defuseLength < 15.f ? defuseLength : 10.f;
             defuseStartedAt = now;
+            defuseStartedGameTime = curTime;
         }
-        const float defuseElapsed =
-            std::chrono::duration<float>(now - defuseStartedAt).count();
+        float defuseRemaining;
+        if (hasGameTime && defuseStartedGameTime > 0.f) {
+            defuseRemaining = std::max(0.f,
+                trackedDefuseLength - (curTime - defuseStartedGameTime));
+        } else {
+            const float defuseElapsed =
+                std::chrono::duration<float>(now - defuseStartedAt).count();
+            defuseRemaining = std::max(
+                0.f, trackedDefuseLength - defuseElapsed);
+        }
         next.defuseLength = trackedDefuseLength;
-        next.defuseRemaining =
-            std::max(0.f, trackedDefuseLength - defuseElapsed);
+        next.defuseRemaining = defuseRemaining;
         next.defuseProgress = std::clamp(
-            defuseElapsed / trackedDefuseLength, 0.f, 1.f);
+            1.f - defuseRemaining / std::max(1.f, trackedDefuseLength),
+            0.f, 1.f);
     } else {
         trackedDefuseLength = 0.f;
         defuseStartedAt = {};
+        defuseStartedGameTime = 0.f;
     }
     wasBeingDefused = next.beingDefused;
     if (sceneNode && absOriginOff) {
@@ -2464,6 +2650,9 @@ static void ReadBombInfo(HANDLE hProc, uintptr_t client,
     next.valid = true;
     next.sampledAtMs = GetTickCount64();
     out = next;
+    EspLog("[Bomb] planted=1 timer=%.1f defused=%d beingDefused=%d origin=(%.0f,%.0f,%.0f)",
+        next.timer, (int)next.defused, (int)next.beingDefused,
+        next.origin.x, next.origin.y, next.origin.z);
 }
 
 static void DrawBombTimer(HDC dc, int sw, int sh, const BombInfo& bomb) {
