@@ -2120,7 +2120,10 @@ static void OverlayLoop(HANDLE hProc) {
         {
             if (!espOn) break;
             if (!p.alive) continue;
-            if (localTeam && p.team == localTeam) continue;
+            if (espSettings.teamCheck && localTeam && p.team == localTeam) continue;
+            if ((p.team == 2 && !espSettings.showTeamCT) ||
+                (p.team == 3 && !espSettings.showTeamT))
+                continue;
             if (espSettings.visibleOnly && !p.visible) continue;
 
             Vec2 head, foot;
@@ -2489,6 +2492,89 @@ static void ReadBombInfo(HANDLE hProc, uintptr_t client,
                                 &team, sizeof(team)}}) == 1 &&
                             (team == 2 || team == 3))
                             worldState.carrierTeam = team;
+                    }
+                }
+            }
+        }
+        if (!worldState.carried) {
+            const uintptr_t localPawnOff =
+                FindStaticOff("client.dll", "dwLocalPlayerPawn");
+            const uintptr_t weaponServicesOff = FindFieldOff(
+                "client.dll", "CCSPlayer_WeaponServices", "m_pWeaponServices");
+            const uintptr_t myWeaponsOff = FindFieldOff(
+                "client.dll", "CCSPlayer_WeaponServices", "m_hMyWeapons");
+            const uintptr_t identityOff2 = FindFieldOff(
+                "client.dll", "CEntityInstance", "m_pEntity");
+            const uintptr_t designerNameOff2 = FindFieldOff(
+                "client.dll", "CEntityIdentity", "m_designerName");
+            const uintptr_t teamOff2 = FindFieldOff(
+                "client.dll", "C_BaseEntity", "m_iTeamNum");
+            if (localPawnOff && weaponServicesOff && myWeaponsOff &&
+                identityOff2 && designerNameOff2 && teamOff2 &&
+                entityListOff) {
+                uintptr_t localPawn = 0;
+                if (ExecuteExactReads({{
+                        client + localPawnOff,
+                        &localPawn, sizeof(localPawn)}}) == 1 && localPawn) {
+                    uintptr_t services = 0;
+                    if (ExecuteExactReads({{
+                            localPawn + weaponServicesOff,
+                            &services, sizeof(services)}}) == 1 && services) {
+                        uint32_t weapons[8] = {0xFFFFFFFFu, 0xFFFFFFFFu,
+                            0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                            0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+                        ExecuteExactReads({{
+                            services + myWeaponsOff,
+                            weapons, sizeof(weapons)}});
+                        uintptr_t entityList = 0;
+                        if (ExecuteExactReads({{
+                                client + entityListOff,
+                                &entityList, sizeof(entityList)}}) == 1 &&
+                            entityList) {
+                            for (int i = 0; i < 8 && !worldState.carried; ++i) {
+                                const uint32_t handle = weapons[i];
+                                const uint32_t index = handle & 0x7FFFu;
+                                if (handle == 0 || handle == 0xFFFFFFFFu ||
+                                    index == 0 || index > 2048)
+                                    continue;
+                                uintptr_t bucket = 0;
+                                if (ExecuteExactReads({{
+                                        entityList + 0x10 +
+                                            sizeof(uintptr_t) * (index >> 9),
+                                        &bucket, sizeof(bucket)}}) != 1 ||
+                                    !bucket)
+                                    continue;
+                                uintptr_t ent = 0;
+                                ExecuteExactReads({{
+                                    bucket + 0x70ULL * (index & 0x1FF),
+                                    &ent, sizeof(ent)}});
+                                if (!ent) continue;
+                                uintptr_t identity = 0;
+                                if (ExecuteExactReads({{
+                                        ent + identityOff2,
+                                        &identity, sizeof(identity)}}) != 1 ||
+                                    !identity)
+                                    continue;
+                                uintptr_t namePtr = 0;
+                                if (ExecuteExactReads({{
+                                        identity + designerNameOff2,
+                                        &namePtr, sizeof(namePtr)}}) != 1 ||
+                                    !namePtr)
+                                    continue;
+                                char name[16] = {};
+                                ExecuteExactReads({{
+                                    namePtr, name, sizeof(name) - 1}});
+                                if (strncmp(name, "weapon_c4", 9) == 0) {
+                                    worldState.carried = true;
+                                    int team = 0;
+                                    if (ExecuteExactReads({{
+                                            localPawn + teamOff2,
+                                            &team, sizeof(team)}}) == 1 &&
+                                        (team == 2 || team == 3))
+                                        worldState.carrierTeam = team;
+                                }
+                            }
+                        }
                     }
                 }
             }

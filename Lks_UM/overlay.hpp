@@ -184,6 +184,9 @@ struct EspSettings {
     bool showGrenades = true;
     bool showHostages = false;
     bool showChickens = false;
+    bool showTeamCT = true;
+    bool showTeamT = true;
+    bool teamCheck = true;
     bool showDefuseKit = true;
     bool showTimer = true;
     bool showGameInfo = true;

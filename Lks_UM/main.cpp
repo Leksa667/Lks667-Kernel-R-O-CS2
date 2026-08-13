@@ -786,6 +786,9 @@ static void SaveConfig() {
     f << "showGrenades=" << g_EspSettings.showGrenades << "\n";
     f << "showBomb=" << g_EspSettings.showBomb << "\n";
     f << "showChickens=" << g_EspSettings.showChickens << "\n";
+    f << "showTeamCT=" << g_EspSettings.showTeamCT << "\n";
+    f << "showTeamT=" << g_EspSettings.showTeamT << "\n";
+    f << "espTeamCheck=" << g_EspSettings.teamCheck << "\n";
     f << "boxStyle=" << g_EspSettings.boxStyle << "\n";
     f << "boxColor=" << static_cast<unsigned long>(g_EspSettings.boxColor) << "\n";
     f << "skeletonColor=" << static_cast<unsigned long>(g_EspSettings.skeletonColor) << "\n";
@@ -844,6 +847,9 @@ static void LoadConfig() {
             else if (key == "showGrenades") g_EspSettings.showGrenades = (val == "1");
             else if (key == "showBomb") g_EspSettings.showBomb = (val == "1");
             else if (key == "showChickens") g_EspSettings.showChickens = (val == "1");
+            else if (key == "showTeamCT") g_EspSettings.showTeamCT = (val == "1");
+            else if (key == "showTeamT") g_EspSettings.showTeamT = (val == "1");
+            else if (key == "espTeamCheck") g_EspSettings.teamCheck = (val == "1");
             else if (key == "boxStyle")
                 g_EspSettings.boxStyle =
                     std::clamp(std::stoi(val), 0, BOX_STYLE_COUNT - 1);
@@ -1803,7 +1809,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int show) {
     wc.lpszClassName = L"LksMenu";
     RegisterClass(&wc);
 
-    int w = 1100, h = 720;
+    const UINT dpi = GetDpiForSystem();
+    int w = MulDiv(1100, static_cast<int>(dpi), 96);
+    int h = MulDiv(880, static_cast<int>(dpi), 96);
+    w = std::min(w, GetSystemMetrics(SM_CXSCREEN) - 80);
+    h = std::min(h, GetSystemMetrics(SM_CYSCREEN) - 80);
     g_hWnd = CreateWindowEx(
         WS_EX_LAYERED | WS_EX_TOPMOST,
         L"LksMenu",
