@@ -34,6 +34,11 @@ HWND g_hwnd = nullptr;
 Renderer g_renderer;
 std::wstring g_folder;
 bool g_visible = false;
+bool g_french = true;
+
+const wchar_t* Tr(const wchar_t* french, const wchar_t* english) {
+    return g_french ? french : english;
+}
 
 void SavePos() {
     if (g_folder.empty() || !g_hwnd) return;
@@ -67,7 +72,7 @@ void ApplyVisibility() {
 void DrawBomb(const BombInfo& bomb, int localTeam) {
     const float x = (float)kPad;
     const float textW = (float)(kWidth - 2 * kPad);
-    g_renderer.text(L"BOMBE", D2D1::RectF(x, 20, x + 90, 36), FontCaption, accent);
+    g_renderer.text(Tr(L"BOMBE", L"BOMB"), D2D1::RectF(x, 20, x + 90, 36), FontCaption, accent);
     if (bomb.site >= 0) {
         wchar_t site[16]{};
         swprintf_s(site, L"SITE %c", bomb.site == 0 ? L'A' : L'B');
@@ -76,22 +81,22 @@ void DrawBomb(const BombInfo& bomb, int localTeam) {
     }
 
     if (!bomb.valid) {
-        g_renderer.text(L"EN ATTENTE", D2D1::RectF(x, 42, textW, 72),
+        g_renderer.text(Tr(L"EN ATTENTE", L"WAITING"), D2D1::RectF(x, 42, textW, 72),
             FontBodyStrong, text_dim);
         return;
     }
     if (bomb.carried) {
         if (bomb.carrierTeam != 0 && bomb.carrierTeam != localTeam) {
-            g_renderer.text(bomb.carrierTeam == 2 ? L"PORTEE PAR CT" : L"PORTEE PAR T",
+            g_renderer.text(bomb.carrierTeam == 2 ? Tr(L"PORTÉE PAR CT", L"CARRIED BY CT") : Tr(L"PORTÉE PAR T", L"CARRIED BY T"),
                 D2D1::RectF(x, 42, textW, 74), FontDisplay, accent);
         } else {
-            g_renderer.text(L"EN ATTENTE", D2D1::RectF(x, 42, textW, 72),
+            g_renderer.text(Tr(L"EN ATTENTE", L"WAITING"), D2D1::RectF(x, 42, textW, 72),
                 FontBodyStrong, text_dim);
         }
         return;
     }
     if (bomb.dropped) {
-        g_renderer.text(L"AU SOL", D2D1::RectF(x, 42, textW, 74),
+        g_renderer.text(Tr(L"AU SOL", L"DROPPED"), D2D1::RectF(x, 42, textW, 74),
             FontDisplay, accent);
         return;
     }
@@ -99,7 +104,7 @@ void DrawBomb(const BombInfo& bomb, int localTeam) {
     wchar_t buf[64]{};
     D2D1_COLOR_F color = accent;
     if (bomb.defused) {
-        swprintf_s(buf, L"DEFUSEE");
+        swprintf_s(buf, L"%s", Tr(L"DÉSAMORCÉE", L"DEFUSED"));
         color = warn;
     } else {
         const float sinceSample = bomb.sampledAtMs ?
@@ -131,8 +136,9 @@ void DrawBomb(const BombInfo& bomb, int localTeam) {
         const float bombRemaining = std::max(0.f, bomb.timer - sinceSample);
         const bool hasTime = defuseRemaining <= bombRemaining;
         const bool hasKit = bomb.defuseLength <= 5.5f;
-        swprintf_s(buf, L"DEFUSE %.1fs %s %s", defuseRemaining,
-            hasKit ? L"KIT" : L"NO KIT", hasTime ? L"SAFE" : L"TOO LATE");
+        swprintf_s(buf, L"%s %.1fs %s %s", Tr(L"DÉSAMORÇAGE", L"DEFUSE"), defuseRemaining,
+            hasKit ? L"KIT" : Tr(L"SANS KIT", L"NO KIT"),
+            hasTime ? Tr(L"À TEMPS", L"SAFE") : Tr(L"TROP TARD", L"TOO LATE"));
         g_renderer.text(buf, D2D1::RectF(x, 88, textW, 106),
             FontCaption, hasTime ? warn : danger);
     }
@@ -152,7 +158,7 @@ void DrawInfo(const HudData& d) {
     swprintf_s(buf, L"%.0f", d.fps);
     row(L"FPS", buf, accent);
     swprintf_s(buf, L"%d", d.players);
-    row(L"Joueurs", buf, text_hi);
+    row(Tr(L"Joueurs", L"Players"), buf, text_hi);
     swprintf_s(buf, L"%.2f ms", d.readMs);
     row(L"Kernel", buf, text);
     swprintf_s(buf, L"%.1f Hz", d.snapshotHz);
@@ -271,4 +277,9 @@ void HudRefresh() {
         g_data.showBomb = g_MiscSettings.showBombTimer;
     }
     ApplyVisibility();
+}
+
+void HudSetFrench(bool french) {
+    g_french = french;
+    if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
 }

@@ -1126,12 +1126,24 @@ static bool ReadWorldEntities(
         "client.dll", "C_BaseEntity", "m_pGameSceneNode");
     const uintptr_t originOff = FindFieldOff(
         "client.dll", "CGameSceneNode", "m_vecAbsOrigin");
+    const uintptr_t localOriginOff = FindFieldOff(
+        "client.dll", "CGameSceneNode", "m_vecOrigin");
+    const uintptr_t modelStateOff = FindFieldOff(
+        "client.dll", "CSkeletonInstance", "m_modelState");
+    const uintptr_t modelNameOff = FindFieldOff(
+        "client.dll", "CModelState", "m_ModelName");
     const uintptr_t parentOff = FindFieldOff(
         "client.dll", "CGameSceneNode", "m_pParent");
     const uintptr_t ownerOff = FindFieldOff(
         "client.dll", "C_BaseEntity", "m_hOwnerEntity");
     const uintptr_t ownerPawnOff = FindFieldOff(
         "client.dll", "C_BasePlayerWeapon", "m_hOwnerPawn");
+    const uintptr_t collisionOff = FindFieldOff(
+        "client.dll", "C_BaseEntity", "m_pCollision");
+    const uintptr_t collisionMinsOff = FindFieldOff(
+        "client.dll", "CCollisionProperty", "m_vecMins");
+    const uintptr_t collisionMaxsOff = FindFieldOff(
+        "client.dll", "CCollisionProperty", "m_vecMaxs");
     if (!entityListOff || !identityOff ||
         !designerNameOff || !sceneNodeOff || !originOff || !ownerOff) {
         EspLog("[World] MISSING offsets eList=0x%llX id=0x%llX dn=0x%llX sn=0x%llX or=0x%llX ow=0x%llX",
@@ -1208,6 +1220,11 @@ static bool ReadWorldEntities(
             static_cast<uint16_t>(names[index].size() - 1)});
     ExecuteExactReads(jobs);
 
+    struct RootBoneData {
+        Vec3 position = {};
+        uint8_t padding[20] = {};
+    };
+    static_assert(sizeof(RootBoneData) == 32);
     struct Candidate {
         int index;
         EntityType type;
@@ -1215,15 +1232,30 @@ static bool ReadWorldEntities(
         uintptr_t sceneNode = 0;
         uintptr_t sceneParent = 0;
         Vec3 origin = {};
+        Vec3 localOrigin = {};
+        Vec3 parentOrigin = {};
+        uintptr_t boneArray = 0;
+        RootBoneData rootBone = {};
+        uintptr_t modelNamePtr = 0;
+        std::array<char, 160> modelName = {};
+        uintptr_t collision = 0;
+        Vec3 collisionMins = {};
+        Vec3 collisionMaxs = {};
         uint32_t owner = 0xFFFFFFFFu;
         uint32_t ownerPawn = 0xFFFFFFFFu;
     };
     std::vector<Candidate> candidates;
+    std::vector<std::string> sampledDesignerNames;
+    sampledDesignerNames.reserve(128);
     for (int index = 1; index <= highest; ++index) {
         if (!entities[index] || names[index][0] == '\0') continue;
         std::string name(names[index].data());
         std::transform(name.begin(), name.end(), name.begin(),
             [](unsigned char c) { return static_cast<char>(tolower(c)); });
+        if (settings.showChickens && sampledDesignerNames.size() < 128 &&
+            std::find(sampledDesignerNames.begin(), sampledDesignerNames.end(),
+                name) == sampledDesignerNames.end())
+            sampledDesignerNames.push_back(name);
         EntityType type = ENT_UNKNOWN;
         const bool projectile = name.find("_projectile") != std::string::npos;
         
@@ -1233,7 +1265,8 @@ static bool ReadWorldEntities(
             name == "weapon_hegrenade" || name == "weapon_flashbang" ||
             name == "weapon_smokegrenade" || name == "weapon_molotov" ||
             name == "weapon_incgrenade" || name == "weapon_decoy";
-        if (name == "chicken" || name.find("chicken") != std::string::npos)
+        if (name == "chicken" || name.find("chicken") != std::string::npos ||
+            name == "basemodelentity" || name == "prop_dynamic")
             type = ENT_CHICKEN;
         else if (name == "weapon_c4") type = ENT_BOMB;
         else if (grenade) type = ENT_GRENADE;
@@ -1246,6 +1279,17 @@ static bool ReadWorldEntities(
         candidates.push_back({index, type, std::move(name)});
     }
 
+    static unsigned chickenDiagnosticCounter = 0;
+    if (settings.showChickens && (chickenDiagnosticCounter++ % 16u) == 0u) {
+        std::string sample;
+        for (const auto& name : sampledDesignerNames) {
+            if (!sample.empty()) sample += ", ";
+            sample += name;
+        }
+        EspLog("[Chicken] highest=%d nonEmptyNames=%zu sample=[%s]",
+            highest, sampledDesignerNames.size(), sample.c_str());
+    }
+
     jobs.clear();
     for (auto& candidate : candidates) {
         const uintptr_t entity = entities[candidate.index];
@@ -1256,6 +1300,9 @@ static bool ReadWorldEntities(
         if (ownerPawnOff && candidate.type != ENT_GRENADE)
             jobs.push_back({entity + ownerPawnOff, &candidate.ownerPawn,
                 sizeof(candidate.ownerPawn)});
+        if (candidate.type == ENT_CHICKEN && collisionOff)
+            jobs.push_back({entity + collisionOff, &candidate.collision,
+                sizeof(candidate.collision)});
     }
     ExecuteExactReads(jobs);
 
@@ -1267,11 +1314,64 @@ static bool ReadWorldEntities(
                 &candidate.sceneParent, sizeof(candidate.sceneParent)});
         jobs.push_back({candidate.sceneNode + originOff,
             &candidate.origin, sizeof(candidate.origin)});
+        if (localOriginOff)
+            jobs.push_back({candidate.sceneNode + localOriginOff,
+                &candidate.localOrigin, sizeof(candidate.localOrigin)});
+        if (modelStateOff && candidate.type == ENT_CHICKEN)
+            jobs.push_back({candidate.sceneNode + modelStateOff + 0x80,
+                &candidate.boneArray, sizeof(candidate.boneArray)});
+        if (modelStateOff && modelNameOff && candidate.type == ENT_CHICKEN)
+            jobs.push_back({candidate.sceneNode + modelStateOff + modelNameOff,
+                &candidate.modelNamePtr, sizeof(candidate.modelNamePtr)});
+    }
+    ExecuteExactReads(jobs);
+
+    jobs.clear();
+    for (auto& candidate : candidates)
+        if (candidate.sceneParent)
+            jobs.push_back({candidate.sceneParent + originOff,
+                &candidate.parentOrigin, sizeof(candidate.parentOrigin)});
+    for (auto& candidate : candidates)
+        if (candidate.type == ENT_CHICKEN && candidate.boneArray)
+            jobs.push_back({candidate.boneArray, &candidate.rootBone,
+                sizeof(candidate.rootBone)});
+    for (auto& candidate : candidates)
+        if (candidate.type == ENT_CHICKEN && candidate.modelNamePtr)
+            jobs.push_back({candidate.modelNamePtr, candidate.modelName.data(),
+                static_cast<uint16_t>(candidate.modelName.size() - 1)});
+    for (auto& candidate : candidates) {
+        if (candidate.type != ENT_CHICKEN || !candidate.collision) continue;
+        if (collisionMinsOff)
+            jobs.push_back({candidate.collision + collisionMinsOff,
+                &candidate.collisionMins, sizeof(candidate.collisionMins)});
+        if (collisionMaxsOff)
+            jobs.push_back({candidate.collision + collisionMaxsOff,
+                &candidate.collisionMaxs, sizeof(candidate.collisionMaxs)});
     }
     ExecuteExactReads(jobs);
 
     output.reserve(candidates.size());
     for (auto& candidate : candidates) {
+        if (candidate.type == ENT_CHICKEN &&
+            (candidate.name == "basemodelentity" ||
+             candidate.name == "prop_dynamic")) {
+            std::string model(candidate.modelName.data());
+            std::transform(model.begin(), model.end(), model.begin(),
+                [](unsigned char c) { return static_cast<char>(tolower(c)); });
+            const bool namedChicken =
+                model.find("chicken") != std::string::npos;
+            const bool infernoEmbeddedChicken =
+                candidate.name == "basemodelentity" &&
+                model.rfind(
+                    "maps/de_inferno/entities/unnamed_13103_4_", 0) == 0 &&
+                (candidate.collisionMaxs.x - candidate.collisionMins.x) >= 8.f &&
+                (candidate.collisionMaxs.x - candidate.collisionMins.x) <= 48.f &&
+                (candidate.collisionMaxs.y - candidate.collisionMins.y) >= 8.f &&
+                (candidate.collisionMaxs.y - candidate.collisionMins.y) <= 48.f &&
+                (candidate.collisionMaxs.z - candidate.collisionMins.z) >= 12.f &&
+                (candidate.collisionMaxs.z - candidate.collisionMins.z) <= 80.f;
+            if (!namedChicken && !infernoEmbeddedChicken) continue;
+        }
         const bool projectile =
             candidate.name.find("_projectile") != std::string::npos;
         const auto validOwnerHandle = [highest](uint32_t handle) {
@@ -1286,14 +1386,19 @@ static bool ReadWorldEntities(
             ? (candidate.ownerPawn & 0x7FFFu)
             : (candidate.owner & 0x7FFFu);
         const bool attachedToSceneParent = candidate.sceneParent != 0;
-        if (candidate.type != ENT_BOMB && !projectile &&
+        // This filter applies to dropped inventory items only. Chickens are
+        // animated entities and normally have a scene parent.
+        const bool isInventoryItem = candidate.type == ENT_WEAPON ||
+            candidate.type == ENT_GRENADE;
+        if (isInventoryItem && !projectile &&
             (hasOwner || attachedToSceneParent))
             continue;
         WorldEnt world;
         world.ptr = entities[candidate.index];
         world.owner = hasOwner ? entities[ownerIndex] : 0;
         world.type = candidate.type;
-        world.name = FriendlyWorldName(candidate.name);
+        world.name = candidate.type == ENT_CHICKEN ?
+            "Chicken" : FriendlyWorldName(candidate.name);
         if (candidate.type == ENT_BOMB) {
             world.origin = candidate.sceneNode ? candidate.origin : Vec3{};
             if (!std::isfinite(world.origin.x) ||
@@ -1306,10 +1411,26 @@ static bool ReadWorldEntities(
         }
         if (!candidate.sceneNode) continue;
         world.origin = candidate.origin;
+        if (candidate.type == ENT_CHICKEN) {
+            const auto usable = [](const Vec3& value) {
+                return std::isfinite(value.x) && std::isfinite(value.y) &&
+                    std::isfinite(value.z) &&
+                    (std::fabs(value.x) > 0.01f ||
+                     std::fabs(value.y) > 0.01f ||
+                     std::fabs(value.z) > 0.01f);
+            };
+            if (usable(candidate.rootBone.position))
+                world.origin = candidate.rootBone.position;
+            else if (!usable(world.origin) && usable(candidate.parentOrigin))
+                world.origin = candidate.parentOrigin;
+            if (!usable(world.origin) && usable(candidate.localOrigin))
+                world.origin = candidate.localOrigin;
+            if (!usable(world.origin)) continue;
+        }
         if (!std::isfinite(world.origin.x) ||
             !std::isfinite(world.origin.y) ||
             !std::isfinite(world.origin.z)) continue;
-        {
+        if (isInventoryItem) {
             bool overlapsInventory = false;
             for (const auto& player : players) {
                 const float dx = world.origin.x - player.origin.x;
@@ -1326,11 +1447,12 @@ static bool ReadWorldEntities(
     }
     static int worldScanCounter = 0;
     if ((worldScanCounter++ & 255) == 0) {
-        size_t bombs = 0;
+        size_t bombs = 0, chickens = 0;
         for (const auto& w : output)
             if (w.type == ENT_BOMB) bombs++;
-        EspLog("[World] scan ent=%d cand=%zu out=%zu bomb=%zu",
-            highest, candidates.size(), output.size(), bombs);
+            else if (w.type == ENT_CHICKEN) chickens++;
+        EspLog("[World] scan ent=%d cand=%zu out=%zu bomb=%zu chicken=%zu",
+            highest, candidates.size(), output.size(), bombs, chickens);
     }
     return g_Client.IsTransportHealthy();
 }
