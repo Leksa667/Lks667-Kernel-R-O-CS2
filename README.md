@@ -24,7 +24,7 @@ Briefly, consider encrypting all strings, employing methods from my other reposi
 - Config profiles automatically discovered from the Documents folder.
 
 
-<img width="2486" height="988" alt="image" src="https://github.com/user-attachments/assets/22eb156a-b60a-4334-b1b2-22eadbd42ff6" />
+<img width="2523" height="1039" alt="image" src="https://github.com/user-attachments/assets/dafb0d2c-ffe7-49b1-bd76-1d14478b24c4" />
 
 
 
